@@ -13,14 +13,13 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 
 # =========================
-# 必填环境变量
+# 环境变量
 # =========================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 DATABASE_URL = (os.getenv("DATABASE_URL") or os.getenv("DATABASE_PUBLIC_URL") or "").strip()
 
-# AI 可选
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4.1-mini").strip()
 ENABLE_AI = os.getenv("ENABLE_AI", "true").lower().strip() == "true"
@@ -30,11 +29,54 @@ LOCAL_TZ = timezone(timedelta(hours=LOCAL_TZ_OFFSET))
 
 
 # =========================
-# 固定参数
+# 发布计划
 # =========================
 
-# 每天 3 轮，每轮 5 条 = 每天 15 条固定栏目
-ROUNDS_PER_DAY = 3
+# 白天 12 条：
+# 今日盯盘 / 热词榜 / 山寨雷达 / 情绪温度，各 3 次
+#
+# 最后 3 条夜间三连：
+# 夜间复盘｜主线行情
+# 山寨复盘｜山寨与情绪
+# 明日盯盘
+
+DAILY_POST_PLAN = [
+    ("今日盯盘", 1),
+    ("热词榜", 1),
+    ("山寨雷达", 1),
+    ("情绪温度", 1),
+
+    ("今日盯盘", 2),
+    ("热词榜", 2),
+    ("山寨雷达", 2),
+    ("情绪温度", 2),
+
+    ("今日盯盘", 3),
+    ("热词榜", 3),
+    ("山寨雷达", 3),
+    ("情绪温度", 3),
+
+    ("夜间复盘", 1),
+    ("夜间复盘", 2),
+    ("夜间复盘", 3),
+]
+
+DAILY_FIXED_POSTS = len(DAILY_POST_PLAN)
+
+# 白天内容间隔：大约 96 分钟一条
+# 夜间三连特殊处理：每条间隔 5 分钟
+POST_INTERVAL_SECONDS = 96 * 60
+NIGHT_REVIEW_CHAIN_INTERVAL_SECONDS = 5 * 60
+
+# 行情异动：每 5 分钟检查一次
+PRICE_CHECK_INTERVAL_SECONDS = 5 * 60
+
+# 同一个币 30 分钟内最多发一次异动
+ALERT_COOLDOWN_MINUTES = 30
+
+# 每轮最多发 2 条异动
+MAX_ALERTS_PER_CHECK = 2
+
 
 CATEGORIES = [
     "今日盯盘",
@@ -44,19 +86,14 @@ CATEGORIES = [
     "夜间复盘",
 ]
 
-# 一天 15 条，平均每 96 分钟一条
-POST_INTERVAL_SECONDS = 96 * 60
+CATEGORY_KEYS = {
+    "今日盯盘": "daily_watch",
+    "热词榜": "hot_words",
+    "山寨雷达": "altcoin_radar",
+    "情绪温度": "sentiment",
+    "夜间复盘": "night_review",
+}
 
-# 行情异动：每 5 分钟检查一次
-PRICE_CHECK_INTERVAL_SECONDS = 5 * 60
-
-# 同一个币 30 分钟内最多发一次异动
-ALERT_COOLDOWN_MINUTES = 30
-
-# 每轮行情检查最多发 2 条异动，防止刷屏
-MAX_ALERTS_PER_CHECK = 2
-
-# 固定栏目图片
 CATEGORY_IMAGES = {
     "今日盯盘": "images/daily_watch.png",
     "热词榜": "images/hot_words.png",
@@ -64,6 +101,11 @@ CATEGORY_IMAGES = {
     "情绪温度": "images/sentiment.png",
     "夜间复盘": "images/night_review.png",
 }
+
+
+# =========================
+# 监控币种
+# =========================
 
 SYMBOLS = [
     "BTCUSDT",
@@ -102,14 +144,6 @@ SYMBOL_DISPLAY = {
     "LINKUSDT": "LINK",
     "AVAXUSDT": "AVAX",
     "WLDUSDT": "WLD",
-}
-
-CATEGORY_KEYS = {
-    "今日盯盘": "daily_watch",
-    "热词榜": "hot_words",
-    "山寨雷达": "altcoin_radar",
-    "情绪温度": "sentiment",
-    "夜间复盘": "night_review",
 }
 
 
@@ -194,7 +228,10 @@ def execute(query: str, params=()):
 
 
 def post_exists(post_key: str) -> bool:
-    row = fetch_one("SELECT id FROM posts_log WHERE post_key=%s;", (post_key,))
+    row = fetch_one(
+        "SELECT id FROM posts_log WHERE post_key=%s;",
+        (post_key,)
+    )
     return bool(row)
 
 
@@ -272,19 +309,6 @@ def http_get_json(url: str, params=None, timeout=12):
 
 
 def fetch_market_data_sync() -> Dict[str, dict]:
-    """
-    返回格式：
-    {
-        "BTCUSDT": {
-            "symbol": "BTCUSDT",
-            "display": "BTC",
-            "price": 100000.0,
-            "change_1h": 0.25,
-            "change_24h": 2.1,
-            "quote_volume": 123456789.0
-        }
-    }
-    """
     base = "https://api.binance.com"
     result: Dict[str, dict] = {}
 
@@ -355,6 +379,22 @@ async def fetch_market_data() -> Dict[str, dict]:
     return await asyncio.to_thread(fetch_market_data_sync)
 
 
+def format_price(price):
+    if price is None:
+        return "未知"
+
+    try:
+        price = float(price)
+    except Exception:
+        return "未知"
+
+    if price >= 100:
+        return f"{price:.2f}"
+    if price >= 1:
+        return f"{price:.4f}"
+    return f"{price:.8f}"
+
+
 def market_snapshot_text(market: Dict[str, dict]) -> str:
     lines = []
 
@@ -363,19 +403,8 @@ def market_snapshot_text(market: Dict[str, dict]) -> str:
         if not item:
             continue
 
-        price = item["price"]
-        if isinstance(price, float):
-            if price >= 100:
-                price_text = f"{price:.2f}"
-            elif price >= 1:
-                price_text = f"{price:.4f}"
-            else:
-                price_text = f"{price:.8f}"
-        else:
-            price_text = "未知"
-
         lines.append(
-            f"{item['display']}: 价格 {price_text}, "
+            f"{item['display']}: 价格 {format_price(item.get('price'))}, "
             f"1h {format_percent(item.get('change_1h'))}, "
             f"24h {format_percent(item.get('change_24h'))}"
         )
@@ -446,6 +475,49 @@ def build_hot_words(market: Dict[str, dict]) -> List[str]:
             break
 
     return words[:7]
+
+
+# =========================
+# 夜间三连标题与焦点
+# =========================
+
+def display_title(category: str, round_no: int) -> str:
+    if category != "夜间复盘":
+        return category
+
+    if round_no == 1:
+        return "夜间复盘"
+    if round_no == 2:
+        return "山寨复盘"
+    if round_no == 3:
+        return "明日盯盘"
+
+    return "夜间复盘"
+
+
+def content_focus(category: str, round_no: int) -> str:
+    if category == "今日盯盘":
+        return "盘中盯盘，重点看 BTC、ETH、山寨资金、短线强弱变化"
+
+    if category == "热词榜":
+        return "提炼当前市场热词，重点看 BTC、ETH、山寨币、MEME、AI币、资金情绪"
+
+    if category == "山寨雷达":
+        return "观察山寨币和高弹性板块，重点看 SOL、DOGE、PEPE、WLD、AVAX、LINK 等方向"
+
+    if category == "情绪温度":
+        return "判断市场情绪热度，重点看追涨风险、资金情绪、短线波动"
+
+    if category == "夜间复盘" and round_no == 1:
+        return "夜间复盘第一条：主线行情复盘，重点看 BTC、ETH 和大盘方向"
+
+    if category == "夜间复盘" and round_no == 2:
+        return "夜间复盘第二条：山寨与情绪复盘，重点看山寨币、MEME、AI币、资金外溢和市场热度"
+
+    if category == "夜间复盘" and round_no == 3:
+        return "夜间复盘第三条：明日盯盘，重点写明天需要观察什么，不要重复前两条"
+
+    return category
 
 
 # =========================
@@ -532,21 +604,28 @@ def build_fixed_prompt(category: str, round_no: int, market: Dict[str, dict]) ->
     hot_words = build_hot_words(market)
     mood = market_mood(market)
 
+    title = display_title(category, round_no)
+    focus = content_focus(category, round_no)
+
     return f"""
 请生成一条“石墨烯财经”频道内容。
 
 要求：
 1. 开头必须带：【第{round_no}轮】
-2. 标题必须是：【石墨烯财经｜{category}】
+2. 标题必须是：【石墨烯财经｜{title}】
 3. 必须有“石墨烯观察：”
-4. 必须有“当前状态：”或“市场倾向：”
+4. 必须有“当前状态：”或“市场倾向：”或“明日重点：”
 5. 末尾带 2-3 个标签
 6. 不要编造新闻、巨鲸金额、爆仓金额
 7. 不要投资建议，不要喊单
 8. 尽量每轮写法不同，不要像模板机
 9. 控制在 450 个中文字以内，适合放在图片 caption 里
+10. 如果是夜间三连，三条角度必须明显不同，不要重复
 
 当前栏目：{category}
+显示标题：{title}
+当前轮次：第{round_no}轮
+本条重点：{focus}
 当前市场情绪：{mood}
 
 行情数据：
@@ -603,6 +682,8 @@ def build_alert_prompt(symbol: str, item: dict, market: Dict[str, dict]) -> str:
 
 def fallback_fixed_content(category: str, round_no: int, market: Dict[str, dict]) -> str:
     mood = market_mood(market)
+    title = display_title(category, round_no)
+
     up = top_movers(market, "change_1h", 3, True)
     down = top_movers(market, "change_1h", 3, False)
 
@@ -610,8 +691,8 @@ def fallback_fixed_content(category: str, round_no: int, market: Dict[str, dict]
     down_text = "、".join([f"{x['display']} {format_percent(x.get('change_1h'))}" for x in down]) or "暂无明显回落"
 
     if category == "今日盯盘":
-        body = f"""【第{round_no}轮】
-【石墨烯财经｜今日盯盘】
+        return f"""【第{round_no}轮】
+【石墨烯财经｜{title}】
 
 本轮重点看三个方向：
 
@@ -625,12 +706,12 @@ def fallback_fixed_content(category: str, round_no: int, market: Dict[str, dict]
 现在不是看单个币涨多少，而是看资金有没有连续性。如果 BTC 不拖后腿，山寨才有继续表现空间。
 
 当前状态：{mood}
-#BTC #ETH #山寨币"""
+#BTC #ETH #山寨币""".strip()
 
-    elif category == "热词榜":
+    if category == "热词榜":
         hot_words = build_hot_words(market)[:5]
-        body = f"""【第{round_no}轮】
-【石墨烯财经｜热词榜】
+        return f"""【第{round_no}轮】
+【石墨烯财经｜{title}】
 
 本轮关键词：
 
@@ -644,11 +725,11 @@ def fallback_fixed_content(category: str, round_no: int, market: Dict[str, dict]
 热词从主流币扩散到山寨和情绪方向，说明市场注意力没有完全冷掉。关键还是看成交量和 BTC 配合。
 
 今日情绪：{mood}
-#BTC #山寨币 #市场情绪"""
+#BTC #山寨币 #市场情绪""".strip()
 
-    elif category == "山寨雷达":
-        body = f"""【第{round_no}轮】
-【石墨烯财经｜山寨雷达】
+    if category == "山寨雷达":
+        return f"""【第{round_no}轮】
+【石墨烯财经｜{title}】
 
 山寨方向继续观察，短线活跃度靠前：{up_text}
 
@@ -656,11 +737,11 @@ def fallback_fixed_content(category: str, round_no: int, market: Dict[str, dict]
 山寨行情不是看一两个币突然拉升，而是看多个板块有没有一起动。如果只是单点上涨，更多是短线资金试探。
 
 当前状态：{mood}
-#山寨币 #MEME #AI币"""
+#山寨币 #MEME #AI币""".strip()
 
-    elif category == "情绪温度":
-        body = f"""【第{round_no}轮】
-【石墨烯财经｜情绪温度】
+    if category == "情绪温度":
+        return f"""【第{round_no}轮】
+【石墨烯财经｜{title}】
 
 当前市场情绪：{mood}
 
@@ -671,27 +752,51 @@ def fallback_fixed_content(category: str, round_no: int, market: Dict[str, dict]
 情绪热得太快，容易被洗；情绪冷到没人看，反而容易出现修复。现在重点看资金是否愿意持续进场。
 
 市场倾向：观察
-#市场情绪 #BTC #交易心理"""
+#市场情绪 #BTC #交易心理""".strip()
 
-    else:
-        body = f"""【第{round_no}轮】
+    if category == "夜间复盘" and round_no == 1:
+        return f"""【第{round_no}轮】
 【石墨烯财经｜夜间复盘】
 
-本轮市场没有给出绝对单边信号。
+主线行情今天没有给出绝对单边信号。
 
 短线靠前：{up_text}
 短线回落：{down_text}
 
 石墨烯观察：
-BTC 如果能稳住，山寨还有轮动机会；如果 BTC 明显走弱，短线资金通常会先从高弹性标的撤出。
-
-明天重点：
-继续看 BTC、ETH 和山寨资金能不能形成合力。
+BTC 和 ETH 仍然是判断市场强弱的核心。只要主线不塌，山寨还有轮动空间；如果 BTC 明显走弱，高弹性标的通常会先被砸。
 
 市场状态：{mood}
-#BTC #ETH #市场复盘"""
+#BTC #ETH #市场复盘""".strip()
 
-    return body.strip()
+    if category == "夜间复盘" and round_no == 2:
+        return f"""【第{round_no}轮】
+【石墨烯财经｜山寨复盘】
+
+山寨方向今天主要看局部活跃度，而不是单个币的短线冲高。
+
+短线靠前：{up_text}
+
+石墨烯观察：
+山寨行情最怕只有单点拉升。如果多个板块一起动，说明情绪在扩散；如果只是一两个币冲高，更像短线资金做热度。
+
+当前状态：{mood}
+#山寨币 #MEME #AI币""".strip()
+
+    return f"""【第{round_no}轮】
+【石墨烯财经｜明日盯盘】
+
+明天重点看三件事：
+
+1. BTC 能不能继续稳住主方向
+2. ETH 是否补涨
+3. 山寨资金有没有继续外溢
+
+石墨烯观察：
+明天真正要看的不是谁突然拉升，而是资金有没有连续性。如果 BTC 稳住，山寨还有机会；如果 BTC 回落，高弹性标的通常会先被砸。
+
+明日重点：观察为主
+#BTC #ETH #山寨币""".strip()
 
 
 def fallback_alert_content(symbol: str, item: dict, market: Dict[str, dict]) -> str:
@@ -765,21 +870,28 @@ async def send_to_channel(bot, content: str, image_path: Optional[str] = None):
 
 
 # =========================
-# 固定栏目循环：每天 15 条
+# 固定栏目循环
 # =========================
 
 def next_pending_fixed_post() -> Optional[Tuple[str, str, int]]:
     date_key = today_key()
 
-    for round_no in range(1, ROUNDS_PER_DAY + 1):
-        for category in CATEGORIES:
-            cat_key = CATEGORY_KEYS[category]
-            post_key = f"{date_key}:round{round_no}:{cat_key}"
+    for category, round_no in DAILY_POST_PLAN:
+        cat_key = CATEGORY_KEYS[category]
+        post_key = f"{date_key}:round{round_no}:{cat_key}"
 
-            if not post_exists(post_key):
-                return post_key, category, round_no
+        if not post_exists(post_key):
+            return post_key, category, round_no
 
     return None
+
+
+def next_sleep_after_post(category: str, round_no: int) -> int:
+    # 夜间三连：第 1 条和第 2 条之后，只等 5 分钟
+    if category == "夜间复盘" and round_no in {1, 2}:
+        return NIGHT_REVIEW_CHAIN_INTERVAL_SECONDS
+
+    return POST_INTERVAL_SECONDS
 
 
 async def fixed_posts_loop(app: Application):
@@ -790,7 +902,7 @@ async def fixed_posts_loop(app: Application):
             pending = next_pending_fixed_post()
 
             if not pending:
-                print("今天 15 条固定栏目已发完，等待下一轮检查")
+                print(f"今天 {DAILY_FIXED_POSTS} 条固定栏目已发完，等待下一轮检查")
                 await asyncio.sleep(10 * 60)
                 continue
 
@@ -808,10 +920,13 @@ async def fixed_posts_loop(app: Application):
 
             print(f"固定栏目已发送：{post_key}")
 
+            sleep_seconds = next_sleep_after_post(category, round_no)
+
         except Exception as e:
             print("固定栏目循环异常:", e)
+            sleep_seconds = POST_INTERVAL_SECONDS
 
-        await asyncio.sleep(POST_INTERVAL_SECONDS)
+        await asyncio.sleep(sleep_seconds)
 
 
 # =========================
@@ -895,7 +1010,7 @@ async def alerts_loop(app: Application):
 
 
 # =========================
-# 简单命令
+# 命令
 # =========================
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -919,13 +1034,14 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"石墨烯雷达图片版运行中。\n\n"
-        f"今日固定栏目：{sent_today} / {ROUNDS_PER_DAY * len(CATEGORIES)}\n"
+        f"今日固定栏目：{sent_today} / {DAILY_FIXED_POSTS}\n"
         f"今日异动提醒：{alerts_today}\n"
-        f"固定栏目间隔：{POST_INTERVAL_SECONDS // 60} 分钟\n"
+        f"白天栏目间隔：{POST_INTERVAL_SECONDS // 60} 分钟\n"
+        f"夜间三连间隔：{NIGHT_REVIEW_CHAIN_INTERVAL_SECONDS // 60} 分钟\n"
         f"行情检查间隔：{PRICE_CHECK_INTERVAL_SECONDS // 60} 分钟\n"
         f"AI：{'开启' if ENABLE_AI else '关闭'}\n"
         f"模型：{MODEL_NAME}\n\n"
-        f"栏目图片：已启用"
+        f"发布结构：白天12条 + 夜间三连3条"
     )
 
 
@@ -933,12 +1049,14 @@ async def post_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending = next_pending_fixed_post()
 
     if not pending:
-        await update.message.reply_text("今天 15 条固定栏目已经发完了。")
+        await update.message.reply_text(f"今天 {DAILY_FIXED_POSTS} 条固定栏目已经发完了。")
         return
 
     post_key, category, round_no = pending
 
-    await update.message.reply_text(f"正在发送下一条：第{round_no}轮｜{category}")
+    await update.message.reply_text(
+        f"正在发送下一条：第{round_no}轮｜{display_title(category, round_no)}"
+    )
 
     try:
         market = await fetch_market_data()
@@ -991,7 +1109,7 @@ def main():
     app.add_handler(CommandHandler("post_now", post_now))
     app.add_handler(CommandHandler("clear_today", clear_today))
 
-    print("石墨烯雷达图片版启动成功：每天 15 条固定栏目，自动配图")
+    print("石墨烯雷达图片版启动成功：白天12条 + 夜间三连3条")
     app.run_polling()
 
 
