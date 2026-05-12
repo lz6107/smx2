@@ -9,8 +9,7 @@ import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Bot
 
 
 # =========================
@@ -27,12 +26,6 @@ ENABLE_AI = os.getenv("ENABLE_AI", "true").lower().strip() == "true"
 
 LOCAL_TZ_OFFSET = int(os.getenv("LOCAL_TZ_OFFSET", "8"))
 LOCAL_TZ = timezone(timedelta(hours=LOCAL_TZ_OFFSET))
-
-ADMIN_IDS = {
-    int(x.strip())
-    for x in os.getenv("ADMIN_IDS", "").split(",")
-    if x.strip().isdigit()
-}
 
 
 # =========================
@@ -244,27 +237,6 @@ SYMBOL_DISPLAY = {
 
 
 # =========================
-# 权限
-# =========================
-
-def is_admin(update: Update) -> bool:
-    if not ADMIN_IDS:
-        return True
-
-    user = update.effective_user
-    return bool(user and user.id in ADMIN_IDS)
-
-
-async def admin_only(update: Update) -> bool:
-    if is_admin(update):
-        return True
-
-    if update.message:
-        await update.message.reply_text("你没有权限操作这个机器人。")
-    return False
-
-
-# =========================
 # 数据库
 # =========================
 
@@ -387,22 +359,6 @@ def record_alert(symbol: str, direction: str, change_1h: float, content: str):
     )
 
 
-def clear_today_logs():
-    today = today_key()
-    local_now_value = now_local()
-    day_start = datetime(local_now_value.year, local_now_value.month, local_now_value.day, tzinfo=LOCAL_TZ)
-
-    execute(
-        "DELETE FROM posts_log WHERE post_key LIKE %s;",
-        (f"{today}:%",)
-    )
-
-    execute(
-        "DELETE FROM alerts_log WHERE sent_at >= %s;",
-        (day_start,)
-    )
-
-
 def last_fixed_sent_at():
     row = fetch_one(
         """
@@ -489,7 +445,7 @@ def http_get_json(url: str, params=None, timeout=12):
 def fetch_market_data_sync() -> Dict[str, dict]:
     """
     稳定版：一个币一个币请求。
-    这样不会因为 Binance 批量 symbols 参数 400 而整批失败。
+    避免 Binance 批量 symbols 参数 400 导致整批失败。
     """
     base = "https://api.binance.com"
     result: Dict[str, dict] = {}
@@ -957,7 +913,7 @@ def safe_caption(content: str) -> str:
     return content[:1000].rstrip() + "\n……"
 
 
-async def send_to_channel(bot, content: str, image_path: Optional[str] = None):
+async def send_to_channel(bot: Bot, content: str, image_path: Optional[str] = None):
     if image_path and os.path.isfile(image_path):
         with open(image_path, "rb") as f:
             await bot.send_photo(
@@ -1013,28 +969,7 @@ def find_due_fixed_post() -> Optional[dict]:
     return None
 
 
-def next_unsent_plan_for_manual() -> Optional[dict]:
-    for plan in DAILY_POST_PLAN:
-        if not post_exists(build_post_key(plan)):
-            return plan
-    return None
-
-
-def next_schedule_text() -> str:
-    now = now_local()
-
-    for plan in DAILY_POST_PLAN:
-        if post_exists(build_post_key(plan)):
-            continue
-
-        scheduled = scheduled_datetime_today(plan["time"])
-        if scheduled >= now:
-            return f"{plan['time']}｜{plan['title']}"
-
-    return "今天固定栏目已全部处理"
-
-
-async def fixed_schedule_loop(app: Application):
+async def fixed_schedule_loop(bot: Bot):
     await asyncio.sleep(8)
 
     while True:
@@ -1053,7 +988,7 @@ async def fixed_schedule_loop(app: Application):
                 content = await generate_fixed_content(plan, market)
 
                 image_path = IMAGE_FILES.get(plan["image_key"])
-                await send_to_channel(app.bot, content, image_path=image_path)
+                await send_to_channel(bot, content, image_path=image_path)
 
                 record_post(plan, content, status="sent")
 
@@ -1092,7 +1027,7 @@ def recently_alerted(symbol: str) -> bool:
     return diff.total_seconds() < ALERT_COOLDOWN_MINUTES * 60
 
 
-async def alerts_loop(app: Application):
+async def alerts_loop(bot: Bot):
     await asyncio.sleep(45)
 
     while True:
@@ -1129,7 +1064,7 @@ async def alerts_loop(app: Application):
                 content = await generate_alert_content(symbol, item, market)
 
                 alert_image_path = IMAGE_FILES.get("market_alert")
-                await send_to_channel(app.bot, content, image_path=alert_image_path)
+                await send_to_channel(bot, content, image_path=alert_image_path)
 
                 record_alert(symbol, direction, change, content)
 
@@ -1146,121 +1081,10 @@ async def alerts_loop(app: Application):
 
 
 # =========================
-# 命令
-# =========================
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_only(update):
-        return
-
-    today = today_key()
-    local_now_value = now_local()
-    day_start = datetime(local_now_value.year, local_now_value.month, local_now_value.day, tzinfo=LOCAL_TZ)
-
-    sent_today = fetch_one(
-        """
-        SELECT COUNT(*) AS c
-        FROM posts_log
-        WHERE post_key LIKE %s
-          AND status='sent';
-        """,
-        (f"{today}:%",)
-    )["c"]
-
-    skipped_today = fetch_one(
-        """
-        SELECT COUNT(*) AS c
-        FROM posts_log
-        WHERE post_key LIKE %s
-          AND status='skipped';
-        """,
-        (f"{today}:%",)
-    )["c"]
-
-    alerts_today = fetch_one(
-        """
-        SELECT COUNT(*) AS c
-        FROM alerts_log
-        WHERE sent_at >= %s;
-        """,
-        (day_start,)
-    )["c"]
-
-    await update.message.reply_text(
-        f"石墨烯雷达正式版运行中。\n\n"
-        f"今日固定栏目已发：{sent_today} / {DAILY_FIXED_POSTS}\n"
-        f"今日已跳过栏目：{skipped_today}\n"
-        f"今日异动提醒：{alerts_today}\n"
-        f"下一条计划：{next_schedule_text()}\n\n"
-        f"固定栏目检查间隔：{SCHEDULE_CHECK_INTERVAL_SECONDS} 秒\n"
-        f"错过补发宽限：{MISSED_POST_GRACE_MINUTES} 分钟\n"
-        f"固定栏目最小间隔：{MIN_FIXED_POST_GAP_MINUTES} 分钟\n"
-        f"行情检查间隔：{PRICE_CHECK_INTERVAL_SECONDS // 60} 分钟\n"
-        f"异动冷却：{ALERT_COOLDOWN_MINUTES} 分钟\n"
-        f"AI：{'开启' if ENABLE_AI else '关闭'}\n"
-        f"模型：{MODEL_NAME}"
-    )
-
-
-async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_only(update):
-        return
-
-    lines = ["今日发布计划："]
-
-    for plan in DAILY_POST_PLAN:
-        mark = "✅" if post_exists(build_post_key(plan)) else "⏳"
-        lines.append(f"{mark} {plan['time']}｜{plan['title']}")
-
-    await update.message.reply_text("\n".join(lines))
-
-
-async def post_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_only(update):
-        return
-
-    plan = next_unsent_plan_for_manual()
-
-    if not plan:
-        await update.message.reply_text(f"今天 {DAILY_FIXED_POSTS} 条固定栏目已经全部处理完。")
-        return
-
-    await update.message.reply_text(
-        f"正在手动发送下一条：{plan['time']}｜{plan['title']}"
-    )
-
-    try:
-        market = await fetch_market_data()
-        content = await generate_fixed_content(plan, market)
-
-        image_path = IMAGE_FILES.get(plan["image_key"])
-        await send_to_channel(context.bot, content, image_path=image_path)
-
-        record_post(plan, content, status="sent")
-
-        await update.message.reply_text("已发送。")
-    except Exception as e:
-        await update.message.reply_text(f"发送失败：{e}")
-
-
-async def clear_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_only(update):
-        return
-
-    clear_today_logs()
-    await update.message.reply_text("已清空今天的固定栏目和异动记录。正式频道慎用。")
-
-
-# =========================
 # 启动
 # =========================
 
-async def post_init(app: Application):
-    asyncio.create_task(fixed_schedule_loop(app))
-    asyncio.create_task(alerts_loop(app))
-
-
-def main():
+async def main_async():
     if not BOT_TOKEN:
         raise RuntimeError("缺少 BOT_TOKEN")
 
@@ -1272,20 +1096,34 @@ def main():
 
     init_db()
 
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
+    bot = Bot(token=BOT_TOKEN)
 
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("schedule", schedule_cmd))
-    app.add_handler(CommandHandler("post_now", post_now))
-    app.add_handler(CommandHandler("clear_today", clear_today))
+    await bot.initialize()
 
-    print("石墨烯雷达正式版启动成功：稳定行情接口 + 8图配图 + 行情异动监控")
-    app.run_polling()
+    # 不使用 polling，不 getUpdates。
+    # 这里删除 webhook 只是为了避免旧 webhook 干扰发送，不会造成 getUpdates 冲突。
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        print("delete_webhook 失败，可忽略:", e)
+
+    print("石墨烯雷达无命令正式版启动成功")
+    print("频道:", CHAT_ID)
+    print("固定栏目:", DAILY_FIXED_POSTS, "条/天")
+    print("行情检查间隔:", PRICE_CHECK_INTERVAL_SECONDS // 60, "分钟")
+    print("不会使用 getUpdates，不会产生 polling 冲突")
+
+    try:
+        await asyncio.gather(
+            fixed_schedule_loop(bot),
+            alerts_loop(bot),
+        )
+    finally:
+        await bot.shutdown()
+
+
+def main():
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":
