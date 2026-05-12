@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional, List
@@ -75,7 +76,6 @@ DAILY_POST_PLAN = [
         "image_key": "sentiment",
         "focus": "午间情绪判断，重点看市场是偏热、偏冷，还是震荡观察。",
     },
-
     {
         "slot_no": 5,
         "slot_key": "afternoon_watch_2",
@@ -112,7 +112,6 @@ DAILY_POST_PLAN = [
         "image_key": "sentiment",
         "focus": "晚间前情绪判断，重点看资金是否愿意继续进场，以及追涨风险。",
     },
-
     {
         "slot_no": 9,
         "slot_key": "night_watch_3",
@@ -149,7 +148,6 @@ DAILY_POST_PLAN = [
         "image_key": "sentiment",
         "focus": "夜盘情绪判断，重点看市场是否过热、是否容易洗盘，以及短线风险。",
     },
-
     {
         "slot_no": 13,
         "slot_key": "night_review_main",
@@ -181,24 +179,13 @@ DAILY_POST_PLAN = [
 
 DAILY_FIXED_POSTS = len(DAILY_POST_PLAN)
 
-# 每 30 秒检查一次是否到发布时间
 SCHEDULE_CHECK_INTERVAL_SECONDS = 30
-
-# 如果错过发布时间 20 分钟以内，会补发；超过 20 分钟就跳过，避免重启后刷屏
 MISSED_POST_GRACE_MINUTES = 20
-
-# 固定栏目之间最小间隔，防止特殊情况下连续挤在一起
 MIN_FIXED_POST_GAP_MINUTES = 7
 
-# 行情异动：每 5 分钟检查一次
 PRICE_CHECK_INTERVAL_SECONDS = 5 * 60
-
-# 正式频道异动冷却：同一个币 90 分钟内最多发一次
 ALERT_COOLDOWN_MINUTES = 90
-
-# 每轮最多发 1 条异动，避免刷屏
 MAX_ALERTS_PER_CHECK = 1
-
 
 IMAGE_FILES = {
     "daily_watch": "images/daily_watch.png",
@@ -206,8 +193,6 @@ IMAGE_FILES = {
     "altcoin_radar": "images/altcoin_radar.png",
     "sentiment": "images/sentiment.png",
     "night_review": "images/night_review.png",
-
-    # 新增三张图
     "altcoin_review": "images/altcoin_review.png",
     "tomorrow_watch": "images/tomorrow_watch.png",
     "market_alert": "images/market_alert.png",
@@ -231,7 +216,6 @@ SYMBOLS = [
     "WLDUSDT",
 ]
 
-# 正式版阈值调高，避免小波动频繁发
 ALERT_THRESHOLDS_1H = {
     "BTCUSDT": 1.0,
     "ETHUSDT": 1.2,
@@ -319,7 +303,6 @@ def init_db():
     );
     """)
 
-    # 兼容之前测试版旧表
     cur.execute("ALTER TABLE posts_log ADD COLUMN IF NOT EXISTS slot_key TEXT;")
     cur.execute("ALTER TABLE posts_log ADD COLUMN IF NOT EXISTS scheduled_time TEXT;")
     cur.execute("ALTER TABLE posts_log ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'sent';")
@@ -504,36 +487,38 @@ def http_get_json(url: str, params=None, timeout=12):
 
 
 def fetch_market_data_sync() -> Dict[str, dict]:
+    """
+    稳定版：一个币一个币请求。
+    这样不会因为 Binance 批量 symbols 参数 400 而整批失败。
+    """
     base = "https://api.binance.com"
     result: Dict[str, dict] = {}
 
-    try:
-        ticker_data = http_get_json(
-            f"{base}/api/v3/ticker/24hr",
-            params={"symbols": json.dumps(SYMBOLS)},
-        )
-    except Exception as e:
-        print("获取 24h ticker 失败:", e)
-        ticker_data = []
-
-    if isinstance(ticker_data, dict):
-        ticker_data = [ticker_data]
-
-    for item in ticker_data:
-        symbol = item.get("symbol")
-        if symbol not in SYMBOLS:
-            continue
+    for symbol in SYMBOLS:
+        display = SYMBOL_DISPLAY.get(symbol, symbol.replace("USDT", ""))
 
         result[symbol] = {
             "symbol": symbol,
-            "display": SYMBOL_DISPLAY.get(symbol, symbol.replace("USDT", "")),
-            "price": safe_float(item.get("lastPrice")),
+            "display": display,
+            "price": None,
             "change_1h": None,
-            "change_24h": safe_float(item.get("priceChangePercent")),
-            "quote_volume": safe_float(item.get("quoteVolume")),
+            "change_24h": None,
+            "quote_volume": None,
         }
 
-    for symbol in SYMBOLS:
+        try:
+            item = http_get_json(
+                f"{base}/api/v3/ticker/24hr",
+                params={"symbol": symbol},
+            )
+
+            result[symbol]["price"] = safe_float(item.get("lastPrice"))
+            result[symbol]["change_24h"] = safe_float(item.get("priceChangePercent"))
+            result[symbol]["quote_volume"] = safe_float(item.get("quoteVolume"))
+
+        except Exception as e:
+            print(f"获取 {symbol} 24h ticker 失败:", e)
+
         try:
             klines = http_get_json(
                 f"{base}/api/v3/klines",
@@ -550,22 +535,15 @@ def fetch_market_data_sync() -> Dict[str, dict]:
                 else:
                     change_1h = None
 
-                if symbol not in result:
-                    result[symbol] = {
-                        "symbol": symbol,
-                        "display": SYMBOL_DISPLAY.get(symbol, symbol.replace("USDT", "")),
-                        "price": close_price,
-                        "change_1h": change_1h,
-                        "change_24h": None,
-                        "quote_volume": None,
-                    }
-                else:
-                    result[symbol]["change_1h"] = change_1h
-                    if result[symbol]["price"] is None:
-                        result[symbol]["price"] = close_price
+                result[symbol]["change_1h"] = change_1h
+
+                if result[symbol]["price"] is None:
+                    result[symbol]["price"] = close_price
 
         except Exception as e:
             print(f"获取 {symbol} 1h kline 失败:", e)
+
+        time.sleep(0.15)
 
     return result
 
@@ -783,7 +761,7 @@ def build_alert_prompt(symbol: str, item: dict, market: Dict[str, dict]) -> str:
     mood = market_mood(market)
 
     return f"""
-请生成一条“石墨烯财经｜异动雷达”正式频道内容。
+请生成一条“石墨烯财经｜行情异动”正式频道内容。
 
 要求：
 1. 标题必须是：【石墨烯财经｜行情异动】
@@ -1150,7 +1128,6 @@ async def alerts_loop(app: Application):
 
                 content = await generate_alert_content(symbol, item, market)
 
-                # 行情异动配新图
                 alert_image_path = IMAGE_FILES.get("market_alert")
                 await send_to_channel(app.bot, content, image_path=alert_image_path)
 
@@ -1307,7 +1284,7 @@ def main():
     app.add_handler(CommandHandler("post_now", post_now))
     app.add_handler(CommandHandler("clear_today", clear_today))
 
-    print("石墨烯雷达正式版启动成功：固定时间表 + 8图配图 + 行情异动监控")
+    print("石墨烯雷达正式版启动成功：稳定行情接口 + 8图配图 + 行情异动监控")
     app.run_polling()
 
 
