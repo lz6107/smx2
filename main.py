@@ -30,14 +30,22 @@ LOCAL_TZ = timezone(timedelta(hours=LOCAL_TZ_OFFSET))
 
 
 # =========================
-# 测试版固定参数
+# 固定参数
 # =========================
 
-ROUNDS_PER_DAY = 7
-CATEGORIES = ["今日盯盘", "热词榜", "山寨雷达", "情绪温度", "夜间复盘"]
+# 每天 3 轮，每轮 5 条 = 每天 15 条固定栏目
+ROUNDS_PER_DAY = 3
 
-# 每 20 分钟发一条固定栏目：35 条约 11 小时 40 分钟跑完
-POST_INTERVAL_SECONDS = 20 * 60
+CATEGORIES = [
+    "今日盯盘",
+    "热词榜",
+    "山寨雷达",
+    "情绪温度",
+    "夜间复盘",
+]
+
+# 一天 15 条，平均每 96 分钟一条
+POST_INTERVAL_SECONDS = 96 * 60
 
 # 行情异动：每 5 分钟检查一次
 PRICE_CHECK_INTERVAL_SECONDS = 5 * 60
@@ -47,6 +55,15 @@ ALERT_COOLDOWN_MINUTES = 30
 
 # 每轮行情检查最多发 2 条异动，防止刷屏
 MAX_ALERTS_PER_CHECK = 2
+
+# 固定栏目图片
+CATEGORY_IMAGES = {
+    "今日盯盘": "images/daily_watch.png",
+    "热词榜": "images/hot_words.png",
+    "山寨雷达": "images/altcoin_radar.png",
+    "情绪温度": "images/sentiment.png",
+    "夜间复盘": "images/night_review.png",
+}
 
 SYMBOLS = [
     "BTCUSDT",
@@ -202,6 +219,22 @@ def record_alert(symbol: str, direction: str, change_1h: float, content: str):
     )
 
 
+def clear_today_logs():
+    today = today_key()
+    local_now = now_local()
+    day_start = datetime(local_now.year, local_now.month, local_now.day, tzinfo=LOCAL_TZ)
+
+    execute(
+        "DELETE FROM posts_log WHERE post_key LIKE %s;",
+        (f"{today}:%",)
+    )
+
+    execute(
+        "DELETE FROM alerts_log WHERE sent_at >= %s;",
+        (day_start,)
+    )
+
+
 # =========================
 # 时间工具
 # =========================
@@ -255,7 +288,6 @@ def fetch_market_data_sync() -> Dict[str, dict]:
     base = "https://api.binance.com"
     result: Dict[str, dict] = {}
 
-    # 24h ticker 一次取多个币种
     try:
         ticker_data = http_get_json(
             f"{base}/api/v3/ticker/24hr",
@@ -282,7 +314,6 @@ def fetch_market_data_sync() -> Dict[str, dict]:
             "quote_volume": safe_float(item.get("quoteVolume")),
         }
 
-    # 1h kline：用当前 1 小时K线开盘到当前价格的变化做短线异动判断
     for symbol in SYMBOLS:
         try:
             klines = http_get_json(
@@ -332,8 +363,19 @@ def market_snapshot_text(market: Dict[str, dict]) -> str:
         if not item:
             continue
 
+        price = item["price"]
+        if isinstance(price, float):
+            if price >= 100:
+                price_text = f"{price:.2f}"
+            elif price >= 1:
+                price_text = f"{price:.4f}"
+            else:
+                price_text = f"{price:.8f}"
+        else:
+            price_text = "未知"
+
         lines.append(
-            f"{item['display']}: 价格 {item['price'] or '未知'}, "
+            f"{item['display']}: 价格 {price_text}, "
             f"1h {format_percent(item.get('change_1h'))}, "
             f"24h {format_percent(item.get('change_24h'))}"
         )
@@ -397,7 +439,6 @@ def build_hot_words(market: Dict[str, dict]) -> List[str]:
     if (wld.get("change_1h") or 0) > 0.8:
         words.append("AI币")
 
-    # 关键词补位，利于测试频道内容丰富度
     for w in ["链上", "合约", "爆仓清洗", "资金情绪", "山寨季"]:
         if w not in words:
             words.append(w)
@@ -503,6 +544,7 @@ def build_fixed_prompt(category: str, round_no: int, market: Dict[str, dict]) ->
 6. 不要编造新闻、巨鲸金额、爆仓金额
 7. 不要投资建议，不要喊单
 8. 尽量每轮写法不同，不要像模板机
+9. 控制在 450 个中文字以内，适合放在图片 caption 里
 
 当前栏目：{category}
 当前市场情绪：{mood}
@@ -540,6 +582,7 @@ def build_alert_prompt(symbol: str, item: dict, market: Dict[str, dict]) -> str:
 6. 末尾带 2-3 个标签
 7. 不要编造新闻、巨鲸金额、爆仓金额
 8. 不要投资建议，不要喊单
+9. 控制在 350 个中文字以内
 
 触发币种：{display}
 1小时涨跌：{format_percent(item.get("change_1h"))}
@@ -696,7 +739,24 @@ async def generate_alert_content(symbol: str, item: dict, market: Dict[str, dict
 # Telegram 发送
 # =========================
 
-async def send_to_channel(bot, content: str):
+def safe_caption(content: str) -> str:
+    content = content.strip()
+    if len(content) <= 1024:
+        return content
+
+    return content[:1000].rstrip() + "\n……"
+
+
+async def send_to_channel(bot, content: str, image_path: Optional[str] = None):
+    if image_path and os.path.isfile(image_path):
+        with open(image_path, "rb") as f:
+            await bot.send_photo(
+                chat_id=CHAT_ID,
+                photo=f,
+                caption=safe_caption(content),
+            )
+        return
+
     await bot.send_message(
         chat_id=CHAT_ID,
         text=content,
@@ -705,7 +765,7 @@ async def send_to_channel(bot, content: str):
 
 
 # =========================
-# 固定栏目循环：一天 35 条
+# 固定栏目循环：每天 15 条
 # =========================
 
 def next_pending_fixed_post() -> Optional[Tuple[str, str, int]]:
@@ -730,8 +790,8 @@ async def fixed_posts_loop(app: Application):
             pending = next_pending_fixed_post()
 
             if not pending:
-                print("今天 35 条固定栏目已发完，等待下一轮检查")
-                await asyncio.sleep(5 * 60)
+                print("今天 15 条固定栏目已发完，等待下一轮检查")
+                await asyncio.sleep(10 * 60)
                 continue
 
             post_key, category, round_no = pending
@@ -741,7 +801,9 @@ async def fixed_posts_loop(app: Application):
             market = await fetch_market_data()
             content = await generate_fixed_content(category, round_no, market)
 
-            await send_to_channel(app.bot, content)
+            image_path = CATEGORY_IMAGES.get(category)
+            await send_to_channel(app.bot, content, image_path=image_path)
+
             record_post(post_key, category, round_no, content)
 
             print(f"固定栏目已发送：{post_key}")
@@ -802,7 +864,6 @@ async def alerts_loop(app: Application):
                 if abs(change) >= threshold and not recently_alerted(symbol):
                     triggered.append(item)
 
-            # 变化幅度大的优先发
             triggered.sort(key=lambda x: abs(x.get("change_1h") or 0), reverse=True)
 
             sent_count = 0
@@ -815,7 +876,10 @@ async def alerts_loop(app: Application):
                 print(f"准备发送异动提醒：{symbol} {format_percent(change)}")
 
                 content = await generate_alert_content(symbol, item, market)
-                await send_to_channel(app.bot, content)
+
+                # 异动雷达暂时纯文字
+                await send_to_channel(app.bot, content, image_path=None)
+
                 record_alert(symbol, direction, change, content)
 
                 sent_count += 1
@@ -831,7 +895,7 @@ async def alerts_loop(app: Application):
 
 
 # =========================
-# 简单状态命令
+# 简单命令
 # =========================
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -854,25 +918,22 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )["c"]
 
     await update.message.reply_text(
-        f"石墨烯雷达测试版运行中。\n\n"
+        f"石墨烯雷达图片版运行中。\n\n"
         f"今日固定栏目：{sent_today} / {ROUNDS_PER_DAY * len(CATEGORIES)}\n"
         f"今日异动提醒：{alerts_today}\n"
         f"固定栏目间隔：{POST_INTERVAL_SECONDS // 60} 分钟\n"
         f"行情检查间隔：{PRICE_CHECK_INTERVAL_SECONDS // 60} 分钟\n"
         f"AI：{'开启' if ENABLE_AI else '关闭'}\n"
-        f"模型：{MODEL_NAME}"
+        f"模型：{MODEL_NAME}\n\n"
+        f"栏目图片：已启用"
     )
 
 
 async def post_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    手动立刻发下一条，测试用。
-    不想用可以不管这个命令。
-    """
     pending = next_pending_fixed_post()
 
     if not pending:
-        await update.message.reply_text("今天 35 条固定栏目已经发完了。")
+        await update.message.reply_text("今天 15 条固定栏目已经发完了。")
         return
 
     post_key, category, round_no = pending
@@ -883,12 +944,19 @@ async def post_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         market = await fetch_market_data()
         content = await generate_fixed_content(category, round_no, market)
 
-        await send_to_channel(context.bot, content)
+        image_path = CATEGORY_IMAGES.get(category)
+        await send_to_channel(context.bot, content, image_path=image_path)
+
         record_post(post_key, category, round_no, content)
 
         await update.message.reply_text("已发送。")
     except Exception as e:
         await update.message.reply_text(f"发送失败：{e}")
+
+
+async def clear_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_today_logs()
+    await update.message.reply_text("已清空今天的固定栏目和异动记录，可以重新测试。")
 
 
 # =========================
@@ -921,8 +989,9 @@ def main():
 
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("post_now", post_now))
+    app.add_handler(CommandHandler("clear_today", clear_today))
 
-    print("石墨烯雷达测试版启动成功：一天压缩跑完 7 天内容")
+    print("石墨烯雷达图片版启动成功：每天 15 条固定栏目，自动配图")
     app.run_polling()
 
 
