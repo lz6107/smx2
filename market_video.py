@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import requests
+from PIL import Image, ImageDraw, ImageFont
 
 
 BINANCE_BASE_URL = "https://api.binance.com"
@@ -40,6 +41,7 @@ MARKET_VIDEO_DURATION_SECONDS = env_int("MARKET_VIDEO_DURATION_SECONDS", 70, 65,
 MARKET_VIDEO_KEEP_FILES = env_bool("MARKET_VIDEO_KEEP_FILES", "false")
 FFMPEG_BINARY = os.getenv("FFMPEG_BINARY", "ffmpeg").strip() or "ffmpeg"
 MARKET_VIDEO_DIR = Path(os.getenv("MARKET_VIDEO_DIR", "market_videos"))
+MARKET_VIDEO_AUDIO_MODE = os.getenv("MARKET_VIDEO_AUDIO_MODE", "silent").strip().lower()
 
 
 def safe_float(value, default=None):
@@ -80,6 +82,23 @@ def format_volume(value: Optional[float]) -> str:
     if value >= 1_000:
         return f"{value / 1_000:.1f}K"
     return f"{value:.0f}"
+
+
+def format_percent_video(value: Optional[float]) -> str:
+    if value is None:
+        return "N/A"
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:.2f}%"
+
+
+def format_price_video(value: Optional[float]) -> str:
+    if value is None:
+        return "N/A"
+    if value >= 100:
+        return f"{value:,.2f}"
+    if value >= 1:
+        return f"{value:.4f}"
+    return f"{value:.8f}"
 
 
 def ass_escape(text: str) -> str:
@@ -351,6 +370,318 @@ def trend_color(value: Optional[float]) -> str:
     return "#19D27F" if value >= 0 else "#FF5B6B"
 
 
+def hex_to_rgb(hex_color: str) -> tuple:
+    color = hex_color.strip().lstrip("#")
+    if len(color) != 6:
+        color = "FFFFFF"
+    return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def load_font(size: int, bold: bool = False):
+    candidates = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc" if bold else "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc" if bold else "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "C:/Windows/Fonts/msyhbd.ttc" if bold else "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+    ]
+
+    for path in candidates:
+        try:
+            if path and Path(path).exists():
+                return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+
+    return ImageFont.load_default()
+
+
+FONT_CACHE = {}
+
+
+def font(size: int, bold: bool = False):
+    key = (size, bold)
+    if key not in FONT_CACHE:
+        FONT_CACHE[key] = load_font(size, bold)
+    return FONT_CACHE[key]
+
+
+def draw_text(draw: ImageDraw.ImageDraw, xy: tuple, text: str, size: int, color: str = "#FFFFFF",
+              bold: bool = False, anchor: str = "la", max_width: Optional[int] = None):
+    value = str(text or "")
+    selected_font = font(size, bold)
+
+    if max_width:
+        while size > 14:
+            box = draw.textbbox((0, 0), value, font=selected_font)
+            if box[2] - box[0] <= max_width:
+                break
+            size -= 2
+            selected_font = font(size, bold)
+
+    text_kwargs = {
+        "fill": hex_to_rgb(color),
+        "font": selected_font,
+    }
+    if anchor and anchor != "la":
+        text_kwargs["anchor"] = anchor
+    draw.text(xy, value, **text_kwargs)
+
+
+def text_size(draw: ImageDraw.ImageDraw, text: str, size: int, bold: bool = False) -> tuple:
+    box = draw.textbbox((0, 0), str(text or ""), font=font(size, bold))
+    return box[2] - box[0], box[3] - box[1]
+
+
+def draw_round_rect(draw: ImageDraw.ImageDraw, box: tuple, fill: str, outline: str = "#223A58",
+                    radius: int = 18, width: int = 2):
+    draw.rounded_rectangle(box, radius=radius, fill=hex_to_rgb(fill), outline=hex_to_rgb(outline), width=width)
+
+
+def draw_gradient_background(draw: ImageDraw.ImageDraw, width: int, height: int):
+    top = hex_to_rgb("#07111F")
+    bottom = hex_to_rgb("#101B2D")
+
+    for y in range(height):
+        t = y / max(1, height - 1)
+        color = tuple(int(top[i] * (1 - t) + bottom[i] * t) for i in range(3))
+        draw.line([(0, y), (width, y)], fill=color)
+
+    grid_color = hex_to_rgb("#172A42")
+    for x in range(0, width, 120):
+        draw.line([(x, 0), (x, height)], fill=grid_color, width=1)
+    for y in range(0, height, 90):
+        draw.line([(0, y), (width, y)], fill=grid_color, width=1)
+
+    draw.ellipse((width - 470, -220, width + 180, 430), fill=hex_to_rgb("#0E3552"))
+    draw.ellipse((-220, height - 360, 520, height + 260), fill=hex_to_rgb("#102E37"))
+
+
+def english_state(state: dict) -> dict:
+    raw = state.get("state")
+    if raw == "偏强":
+        status = "STRONG"
+        headline = "BTC leads. Altcoin flow is expanding"
+    elif raw == "偏弱":
+        status = "WEAK"
+        headline = "BTC under pressure. USDT flow waits"
+    else:
+        status = "RANGE"
+        headline = "BTC range. USDT flow waits for direction"
+
+    breadth = state.get("breadth", {})
+    volume = breadth.get("avg_volume_change")
+    if volume is None:
+        usdt = "USDT volume signal is incomplete"
+    elif volume >= 15:
+        usdt = "USDT pairs are active. Short-term liquidity is warming"
+    elif volume <= -15:
+        usdt = "USDT pairs are cooling. Liquidity is more cautious"
+    else:
+        usdt = "USDT pairs are stable. No clear acceleration yet"
+
+    return {
+        "status": status,
+        "headline": headline,
+        "usdt": usdt,
+    }
+
+
+def draw_panel_title(draw: ImageDraw.ImageDraw, title: str, x: int, y: int):
+    draw_text(draw, (x, y), title.upper(), 26, "#8AD8FF", True)
+    draw.line((x, y + 38, x + 300, y + 38), fill=hex_to_rgb("#284B70"), width=2)
+
+
+def draw_sparkline(draw: ImageDraw.ImageDraw, values: List[float], box: tuple, color: str, reveal: float = 1.0):
+    x, y, w, h = box
+    points = sparkline_points(values, x, y, w, h)
+    if len(points) < 2:
+        draw.line((x, y + h // 2, x + w, y + h // 2), fill=hex_to_rgb("#31445D"), width=3)
+        return
+
+    reveal_count = max(2, min(len(points), int(len(points) * clamp(reveal, 0.05, 1.0))))
+    visible = points[:reveal_count]
+    draw.line((x, y + h // 2, x + w, y + h // 2), fill=hex_to_rgb("#22364E"), width=2)
+    draw.line(visible, fill=hex_to_rgb(color), width=5, joint="curve")
+    px, py = visible[-1]
+    draw.ellipse((px - 7, py - 7, px + 7, py + 7), fill=hex_to_rgb(color))
+
+
+def draw_metric_chip(draw: ImageDraw.ImageDraw, x: int, y: int, label: str, value: Optional[float]):
+    color = trend_color(value)
+    draw_round_rect(draw, (x, y, x + 142, y + 46), "#101F32", "#233C58", 12, 1)
+    draw_text(draw, (x + 14, y + 12), label, 19, "#9AA7B8", True)
+    draw_text(draw, (x + 60, y + 12), format_percent_video(value), 21, color, True, max_width=70)
+
+
+def draw_coin_card(draw: ImageDraw.ImageDraw, item: dict, x: int, y: int, w: int, h: int, reveal: float):
+    color = trend_color(item.get("change_4h"))
+    draw_round_rect(draw, (x, y, x + w, y + h), "#0D1C2E", "#233F5E", 20, 2)
+    draw.rectangle((x, y, x + 7, y + h), fill=hex_to_rgb(color))
+    draw_text(draw, (x + 28, y + 26), item.get("display", "-"), 44, "#FFFFFF", True)
+    draw_text(draw, (x + 164, y + 32), f"${format_price_video(item.get('price'))}", 32, "#EAF1FA", True, max_width=210)
+    draw_metric_chip(draw, x + 398, y + 26, "1H", item.get("change_1h"))
+    draw_metric_chip(draw, x + 548, y + 26, "4H", item.get("change_4h"))
+    draw_sparkline(draw, item.get("closes") or [], (x + 28, y + 94, w - 56, 78), color, reveal)
+    draw_text(
+        draw,
+        (x + 28, y + 190),
+        f"24H {format_percent_video(item.get('change_24h'))}  HIGH {format_price_video(item.get('high_24h'))}  LOW {format_price_video(item.get('low_24h'))}",
+        23,
+        "#9AA7B8",
+        False,
+        max_width=w - 56,
+    )
+
+
+def draw_breadth_bar(draw: ImageDraw.ImageDraw, breadth: dict, x: int, y: int, w: int, h: int):
+    up = breadth.get("up", 0)
+    down = breadth.get("down", 0)
+    total = max(1, up + down)
+    up_w = int(w * up / total)
+    draw_round_rect(draw, (x, y, x + w, y + h), "#17263A", "#243C59", h // 2, 1)
+    if up_w > 0:
+        draw.rounded_rectangle((x, y, x + up_w, y + h), radius=h // 2, fill=hex_to_rgb("#19D27F"))
+    if up_w < w:
+        draw.rounded_rectangle((x + up_w, y, x + w, y + h), radius=h // 2, fill=hex_to_rgb("#FF5B6B"))
+    draw_text(draw, (x, y + h + 14), f"UP {up} / DOWN {down}", 24, "#EAF1FA", True)
+
+
+def draw_rank_bar(draw: ImageDraw.ImageDraw, item: dict, x: int, y: int, w: int, color: str, index: Optional[int] = None):
+    label_prefix = f"{index}. " if index is not None else ""
+    value = item.get("change_4h")
+    label = f"{label_prefix}{item.get('display', '-')}"
+    draw_text(draw, (x, y), label, 27, "#EAF1FA", True, max_width=130)
+    draw_text(draw, (x + 142, y + 1), format_percent_video(value), 25, color, True, max_width=100)
+    bar_w = int(clamp(abs(value or 0) * 42, 24, w))
+    draw_round_rect(draw, (x + 265, y + 8, x + 265 + w, y + 26), "#17263A", "#243C59", 8, 1)
+    draw.rounded_rectangle((x + 265, y + 8, x + 265 + bar_w, y + 26), radius=8, fill=hex_to_rgb(color))
+
+
+def render_dashboard_frame(market: Dict[str, dict], frame_path: Path, width: int, height: int,
+                           second: int, duration: int) -> None:
+    state = market_state(market)
+    view = english_state(state)
+    breadth = state["breadth"]
+    strong = top_items(market, "change_4h", 5, True)
+    weak = [item for item in top_items(market, "change_4h", 10, False) if (item.get("change_4h") or 0) < 0][:4]
+    chart_items = [item_by_display(market, "BTC"), item_by_display(market, "ETH"), item_by_display(market, "SOL")]
+
+    img = Image.new("RGB", (width, height), "#07111F")
+    draw = ImageDraw.Draw(img)
+    draw_gradient_background(draw, width, height)
+
+    reveal = clamp((second + 1) / 12, 0.12, 1.0)
+    draw_text(draw, (58, 52), "SMX FINANCE // MARKET REFERENCE", 34, "#FFD28A", True)
+    draw_text(draw, (width - 390, 56), datetime.now().strftime("%Y-%m-%d %H:%M"), 24, "#9AA7B8")
+    draw_text(draw, (58, 96), view["headline"], 53, "#FFFFFF", True, max_width=1260)
+    draw_text(draw, (58, 154), "DATA: 24 x 1H Binance candles  |  SILENT VIDEO", 24, "#9AA7B8", True)
+
+    left = (52, 205, 777, 852)
+    center = (805, 205, 1315, 852)
+    right = (1342, 205, 1867, 852)
+    bottom = (52, 878, 1867, 1028)
+    for box in (left, center, right, bottom):
+        draw_round_rect(draw, box, "#0B1B2C", "#24415F", 22, 2)
+
+    y0 = 230
+    for index, item in enumerate(chart_items):
+        draw_coin_card(draw, item, 82, y0 + index * 203, 662, 178, reveal)
+
+    draw_panel_title(draw, "Market State", 835, 235)
+    status_color = "#19D27F" if view["status"] == "STRONG" else "#FF5B6B" if view["status"] == "WEAK" else "#8AD8FF"
+    draw_text(draw, (835, 310), view["status"], 80, status_color, True)
+    draw_breadth_bar(draw, breadth, 835, 420, 430, 30)
+    draw_text(draw, (835, 520), f"AVG 1H: {format_percent_video(breadth.get('avg_1h'))}", 32, "#FFFFFF", True)
+    draw_text(draw, (835, 570), f"VOLUME FLOW: {format_percent_video(breadth.get('avg_volume_change'))}", 32, "#FFFFFF", True)
+    draw_panel_title(draw, "USDT Flow", 835, 655)
+    draw_text(draw, (835, 720), view["usdt"], 30, "#EAF1FA", False, max_width=420)
+
+    draw_panel_title(draw, "Alt Strength 4H", 1370, 235)
+    for i, item in enumerate(strong, 1):
+        draw_rank_bar(draw, item, 1370, 306 + (i - 1) * 62, 205, "#19D27F", i)
+    draw_panel_title(draw, "Short Weakness", 1370, 650)
+    if weak:
+        for i, item in enumerate(weak):
+            draw_rank_bar(draw, item, 1370, 722 + i * 50, 205, "#FF5B6B")
+    else:
+        draw_text(draw, (1370, 724), "No clear 4H weakness", 28, "#9AA7B8", True)
+
+    draw_text(draw, (82, 918), "ACTIONABLE READ", 24, "#8AD8FF", True)
+    read_line = (
+        f"{view['headline']}. Watch BTC as the lead signal; compare ETH/SOL follow-through; "
+        "use altcoin rank as a flow filter, not a single-pump signal."
+    )
+    draw_text(draw, (82, 958), read_line, 32, "#FFFFFF", True, max_width=1450)
+    draw_text(draw, (82, 1000), "KEYWORDS: BTC  ETH  SOL  USDT FLOW  ALTCOINS", 27, "#FFD28A", True)
+
+    progress_w = int((width - 104) * (second + 1) / max(1, duration))
+    draw.rectangle((52, height - 12, 52 + progress_w, height - 6), fill=hex_to_rgb("#8AD8FF"))
+    img.save(frame_path, "PNG")
+
+
+def render_keyword_frame(market: Dict[str, dict], frame_path: Path, width: int, height: int) -> None:
+    state = market_state(market)
+    view = english_state(state)
+    img = Image.new("RGB", (width, height), "#07111F")
+    draw = ImageDraw.Draw(img)
+    draw_gradient_background(draw, width, height)
+
+    draw_text(draw, (92, 92), "SMX FINANCE // MARKET VIDEO", 34, "#FFD28A", True)
+    draw_text(draw, (92, 178), "5 SEARCH WORDS FOR THIS UPDATE", 60, "#FFFFFF", True)
+    draw_text(draw, (92, 270), view["headline"], 34, "#9AA7B8", True, max_width=1180)
+
+    keywords = ["BTC", "ETH", "SOL", "USDT FLOW", "ALTCOINS"]
+    colors = ["#8AD8FF", "#19D27F", "#FFD28A", "#FF9F6E", "#EAF1FA"]
+    for i, keyword in enumerate(keywords):
+        x = 120 + i * 355
+        y = 455
+        draw_round_rect(draw, (x, y, x + 285, y + 150), "#0B1B2C", "#24415F", 24, 2)
+        draw_text(draw, (x + 142, y + 75), keyword, 40, colors[i], True, anchor="mm", max_width=245)
+
+    draw_round_rect(draw, (120, 740, width - 120, 905), "#0B1B2C", "#24415F", 24, 2)
+    draw_text(draw, (160, 790), "Reference only. No investment advice. Silent data screen.", 40, "#FFFFFF", True)
+    draw_text(draw, (160, 850), "Caption keeps: BTC ETH SOL USDT资金 山寨币", 32, "#8AD8FF", True)
+    img.save(frame_path, "PNG")
+
+
+def render_frame_sequence(market: Dict[str, dict], frames_dir: Path, width: int, height: int, duration: int) -> None:
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    keyword_start = max(5, duration - 5)
+    for second in range(duration):
+        frame_path = frames_dir / f"frame_{second:03d}.png"
+        if second >= keyword_start:
+            render_keyword_frame(market, frame_path, width, height)
+        else:
+            render_dashboard_frame(market, frame_path, width, height, second, duration)
+
+
+def run_ffmpeg_from_frames(frames_dir: Path, video_path: Path) -> None:
+    ffmpeg_binary = resolve_ffmpeg_binary()
+    frame_pattern = str(frames_dir / "frame_%03d.png")
+    if MARKET_VIDEO_AUDIO_MODE != "silent":
+        print("[market-video] audio mode forced to silent:", MARKET_VIDEO_AUDIO_MODE)
+
+    cmd = [
+        ffmpeg_binary,
+        "-y",
+        "-framerate", "1",
+        "-i", frame_pattern,
+        "-vf", "fps=30,format=yuv420p",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "22",
+        "-movflags", "+faststart",
+        "-an",
+        str(video_path),
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg 生成视频失败: {result.stderr[-1200:]}")
+
+
 def render_ass(market: Dict[str, dict], ass_path: Path, width: int, height: int, duration: int) -> None:
     state = market_state(market)
     strong = top_items(market, "change_4h", 5, True)
@@ -475,32 +806,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 def run_ffmpeg(ass_path: Path, video_path: Path, width: int, height: int, duration: int) -> None:
-    ffmpeg_binary = resolve_ffmpeg_binary()
-
-    video_src = f"color=c=0x07111F:s={width}x{height}:r=30:d={duration}"
-    audio_src = (
-        "aevalsrc=0.014*(sin(2*PI*220*t)+sin(2*PI*277.18*t)+"
-        f"sin(2*PI*329.63*t)):s=44100:d={duration}"
-    )
-    filter_path = str(ass_path).replace("\\", "/").replace(":", "\\:")
-
-    cmd = [
-        ffmpeg_binary,
-        "-y",
-        "-f", "lavfi", "-i", video_src,
-        "-f", "lavfi", "-i", audio_src,
-        "-vf", f"subtitles={filter_path}",
-        "-shortest",
-        "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", "96k",
-        str(video_path),
-    ]
-
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg 生成视频失败: {result.stderr[-1200:]}")
+    raise RuntimeError("legacy ASS renderer is disabled; use run_ffmpeg_from_frames")
 
 
 def build_market_video(symbols: List[str], display_map: Dict[str, str]) -> dict:
@@ -513,15 +819,15 @@ def build_market_video(symbols: List[str], display_map: Dict[str, str]) -> dict:
     state = market_state(market)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base = MARKET_VIDEO_DIR / f"smx2_market_video_{stamp}"
-    ass_path = base.with_suffix(".ass")
+    frames_dir = MARKET_VIDEO_DIR / f"{base.name}_frames"
     video_path = base.with_suffix(".mp4")
 
-    render_ass(market, ass_path, width, height, duration)
-    run_ffmpeg(ass_path, video_path, width, height, duration)
+    render_frame_sequence(market, frames_dir, width, height, duration)
+    run_ffmpeg_from_frames(frames_dir, video_path)
 
     if not MARKET_VIDEO_KEEP_FILES:
         try:
-            ass_path.unlink(missing_ok=True)
+            shutil.rmtree(frames_dir, ignore_errors=True)
         except Exception:
             pass
 
