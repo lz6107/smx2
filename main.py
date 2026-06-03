@@ -448,12 +448,25 @@ def market_video_post_exists(slot_time: str) -> bool:
     return bool(row)
 
 
+def market_video_post_status(slot_time: str) -> str:
+    row = fetch_one(
+        "SELECT status FROM market_video_log WHERE post_key=%s;",
+        (market_video_post_key(slot_time),),
+    )
+    return row["status"] if row else ""
+
+
 def record_market_video_post(slot_time: str, status: str, headline: str = "", video_path: str = "", error: str = ""):
     execute(
         """
         INSERT INTO market_video_log(post_key, slot_time, status, headline, video_path, error)
         VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT(post_key) DO NOTHING;
+        ON CONFLICT(post_key) DO UPDATE SET
+            status=EXCLUDED.status,
+            headline=EXCLUDED.headline,
+            video_path=EXCLUDED.video_path,
+            error=EXCLUDED.error,
+            created_at=NOW();
         """,
         (
             market_video_post_key(slot_time),
@@ -1255,7 +1268,7 @@ async def market_video_loop(bot: Bot):
     print("[market-video] missed grace minutes:", MARKET_VIDEO_MISSED_GRACE_MINUTES)
     print("[market-video] startup status:", describe_next_market_video_slot())
 
-    if MARKET_VIDEO_TEST_ON_STARTUP and not market_video_post_exists("startup"):
+    if MARKET_VIDEO_TEST_ON_STARTUP and market_video_post_status("startup") != "sent":
         await build_and_send_market_video(bot, "startup")
 
     while True:

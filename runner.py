@@ -56,12 +56,25 @@ def video_post_exists(slot_time: str) -> bool:
     return bool(row)
 
 
+def video_post_status(slot_time: str) -> str:
+    row = radar.fetch_one(
+        "SELECT status FROM market_video_log WHERE post_key=%s;",
+        (video_post_key(slot_time),),
+    )
+    return row["status"] if row else ""
+
+
 def record_video_post(slot_time: str, status: str, headline: str = "", video_path: str = "", error: str = ""):
     radar.execute(
         """
         INSERT INTO market_video_log(post_key, slot_time, status, headline, video_path, error)
         VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT(post_key) DO NOTHING;
+        ON CONFLICT(post_key) DO UPDATE SET
+            status=EXCLUDED.status,
+            headline=EXCLUDED.headline,
+            video_path=EXCLUDED.video_path,
+            error=EXCLUDED.error,
+            created_at=NOW();
         """,
         (
             video_post_key(slot_time),
@@ -182,7 +195,7 @@ async def market_video_loop(bot: Bot):
     print("[market-video] missed grace minutes:", VIDEO_MISSED_GRACE_MINUTES)
     print("[market-video] startup status:", describe_next_market_video_slot())
 
-    if VIDEO_TEST_ON_STARTUP and not video_post_exists("startup"):
+    if VIDEO_TEST_ON_STARTUP and video_post_status("startup") != "sent":
         await build_and_send_market_video(bot, "startup")
 
     while True:
