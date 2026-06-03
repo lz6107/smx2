@@ -11,6 +11,8 @@ from psycopg2.extras import RealDictCursor
 
 from telegram import Bot
 
+import market_video
+
 
 # =========================
 # 环境变量
@@ -180,6 +182,25 @@ PRICE_CHECK_INTERVAL_SECONDS = 5 * 60
 ALERT_COOLDOWN_MINUTES = 90
 MAX_ALERTS_PER_CHECK = 1
 
+MARKET_VIDEO_CHECK_INTERVAL_SECONDS = 30
+
+
+def env_bool(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)).strip())
+    except Exception:
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+MARKET_VIDEO_MISSED_GRACE_MINUTES = env_int("MARKET_VIDEO_MISSED_GRACE_MINUTES", 60, 20, 180)
+MARKET_VIDEO_STARTUP_DELAY_SECONDS = env_int("MARKET_VIDEO_STARTUP_DELAY_SECONDS", 20, 0, 120)
+MARKET_VIDEO_TEST_ON_STARTUP = env_bool("MARKET_VIDEO_TEST_ON_STARTUP", "false")
+
 IMAGE_FILES = {
     "daily_watch": "images/daily_watch.png",
     "hot_words": "images/hot_words.png",
@@ -272,6 +293,19 @@ def init_db():
         change_1h DOUBLE PRECISION,
         content TEXT,
         sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS market_video_log (
+        id SERIAL PRIMARY KEY,
+        post_key TEXT UNIQUE NOT NULL,
+        slot_time TEXT NOT NULL,
+        status TEXT NOT NULL,
+        headline TEXT,
+        video_path TEXT,
+        error TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     """)
 
@@ -400,6 +434,86 @@ def scheduled_datetime_today(hhmm: str) -> datetime:
     hour, minute = [int(x) for x in hhmm.split(":")]
     n = now_local()
     return datetime(n.year, n.month, n.day, hour, minute, tzinfo=LOCAL_TZ)
+
+
+def market_video_post_key(slot_time: str) -> str:
+    return f"{today_key()}:{market_video.market_video_slot_key(slot_time)}"
+
+
+def market_video_post_exists(slot_time: str) -> bool:
+    row = fetch_one(
+        "SELECT id FROM market_video_log WHERE post_key=%s;",
+        (market_video_post_key(slot_time),),
+    )
+    return bool(row)
+
+
+def record_market_video_post(slot_time: str, status: str, headline: str = "", video_path: str = "", error: str = ""):
+    execute(
+        """
+        INSERT INTO market_video_log(post_key, slot_time, status, headline, video_path, error)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT(post_key) DO NOTHING;
+        """,
+        (
+            market_video_post_key(slot_time),
+            slot_time,
+            status,
+            headline[:300],
+            video_path[:500],
+            error[:800],
+        ),
+    )
+
+
+def describe_next_market_video_slot() -> str:
+    now = now_local()
+
+    for slot_time in market_video.MARKET_VIDEO_POST_TIMES:
+        if market_video_post_exists(slot_time):
+            continue
+
+        scheduled = scheduled_datetime_today(slot_time)
+        grace_until = scheduled + timedelta(minutes=MARKET_VIDEO_MISSED_GRACE_MINUTES)
+
+        if now < scheduled:
+            return f"next={slot_time} now={now.strftime('%H:%M:%S')}"
+
+        if scheduled <= now <= grace_until:
+            return f"due={slot_time} now={now.strftime('%H:%M:%S')} grace_until={grace_until.strftime('%H:%M:%S')}"
+
+    return f"no remaining slot today now={now.strftime('%H:%M:%S')}"
+
+
+def find_due_market_video_time():
+    now = now_local()
+
+    for slot_time in market_video.MARKET_VIDEO_POST_TIMES:
+        if market_video_post_exists(slot_time):
+            continue
+
+        scheduled = scheduled_datetime_today(slot_time)
+        grace_until = scheduled + timedelta(minutes=MARKET_VIDEO_MISSED_GRACE_MINUTES)
+
+        if now < scheduled:
+            return None
+
+        if scheduled <= now <= grace_until:
+            return slot_time
+
+        if now > grace_until:
+            print(
+                "[market-video] skip missed slot",
+                slot_time,
+                "now=",
+                now.strftime("%H:%M:%S"),
+                "grace_until=",
+                grace_until.strftime("%H:%M:%S"),
+            )
+            record_market_video_post(slot_time, "skipped", error="MISSED_BY_VIDEO_SCHEDULER")
+            continue
+
+    return None
 
 
 def format_percent(value: Optional[float]) -> str:
@@ -1080,6 +1194,81 @@ async def alerts_loop(bot: Bot):
         await asyncio.sleep(PRICE_CHECK_INTERVAL_SECONDS)
 
 
+async def send_market_video_to_channel(bot: Bot, video_path: str, caption: str):
+    with open(video_path, "rb") as f:
+        await bot.send_video(
+            chat_id=CHAT_ID,
+            video=f,
+            caption=safe_caption(caption),
+            supports_streaming=True,
+            width=market_video.MARKET_VIDEO_WIDTH,
+            height=market_video.MARKET_VIDEO_HEIGHT,
+            duration=market_video.MARKET_VIDEO_DURATION_SECONDS,
+        )
+
+
+def cleanup_market_video_file(video_path: str):
+    if market_video.MARKET_VIDEO_KEEP_FILES:
+        return
+
+    try:
+        if video_path and os.path.exists(video_path):
+            os.remove(video_path)
+    except Exception as e:
+        print("[market-video] cleanup temporary file failed:", e)
+
+
+async def build_and_send_market_video(bot: Bot, slot_time: str):
+    result = {}
+
+    try:
+        print(f"[market-video] generating slot={slot_time}")
+        result = await asyncio.to_thread(
+            market_video.build_market_video,
+            SYMBOLS,
+            SYMBOL_DISPLAY,
+        )
+
+        await send_market_video_to_channel(bot, result["video_path"], result["caption"])
+        record_market_video_post(
+            slot_time,
+            "sent",
+            headline=result.get("headline", ""),
+            video_path=result.get("video_path", ""),
+        )
+        print(f"[market-video] sent slot={slot_time} headline={result.get('headline', '')}")
+    except Exception as e:
+        record_market_video_post(slot_time, "failed", error=str(e))
+        print(f"[market-video] failed slot={slot_time}: {e}")
+    finally:
+        cleanup_market_video_file(result.get("video_path", ""))
+
+
+async def market_video_loop(bot: Bot):
+    if not market_video.ENABLE_MARKET_VIDEOS:
+        print("[market-video] disabled: ENABLE_MARKET_VIDEOS is not true")
+        return
+
+    await asyncio.sleep(MARKET_VIDEO_STARTUP_DELAY_SECONDS)
+    print("[market-video] enabled from main.py")
+    print("[market-video] slots:", ", ".join(market_video.MARKET_VIDEO_POST_TIMES))
+    print("[market-video] missed grace minutes:", MARKET_VIDEO_MISSED_GRACE_MINUTES)
+    print("[market-video] startup status:", describe_next_market_video_slot())
+
+    if MARKET_VIDEO_TEST_ON_STARTUP and not market_video_post_exists("startup"):
+        await build_and_send_market_video(bot, "startup")
+
+    while True:
+        try:
+            slot_time = find_due_market_video_time()
+            if slot_time:
+                await build_and_send_market_video(bot, slot_time)
+        except Exception as e:
+            print("[market-video] loop error:", e)
+
+        await asyncio.sleep(MARKET_VIDEO_CHECK_INTERVAL_SECONDS)
+
+
 # =========================
 # 启动
 # =========================
@@ -1111,12 +1300,16 @@ async def main_async():
     print("频道:", CHAT_ID)
     print("固定栏目:", DAILY_FIXED_POSTS, "条/天")
     print("行情检查间隔:", PRICE_CHECK_INTERVAL_SECONDS // 60, "分钟")
+    print("[market-video] main.py enabled:", market_video.ENABLE_MARKET_VIDEOS)
+    if market_video.ENABLE_MARKET_VIDEOS:
+        print("[market-video] main.py slots:", ", ".join(market_video.MARKET_VIDEO_POST_TIMES))
     print("不会使用 getUpdates，不会产生 polling 冲突")
 
     try:
         await asyncio.gather(
             fixed_schedule_loop(bot),
             alerts_loop(bot),
+            market_video_loop(bot),
         )
     finally:
         await bot.shutdown()
