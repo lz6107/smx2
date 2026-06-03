@@ -10,7 +10,23 @@ import market_video
 
 
 VIDEO_CHECK_INTERVAL_SECONDS = 30
-VIDEO_MISSED_GRACE_MINUTES = 20
+
+
+def env_bool(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)).strip())
+    except Exception:
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+VIDEO_MISSED_GRACE_MINUTES = env_int("MARKET_VIDEO_MISSED_GRACE_MINUTES", 60, 20, 180)
+VIDEO_STARTUP_DELAY_SECONDS = env_int("MARKET_VIDEO_STARTUP_DELAY_SECONDS", 20, 0, 120)
+VIDEO_TEST_ON_STARTUP = env_bool("MARKET_VIDEO_TEST_ON_STARTUP", "false")
 
 
 def init_market_video_db():
@@ -58,6 +74,25 @@ def record_video_post(slot_time: str, status: str, headline: str = "", video_pat
     )
 
 
+def describe_next_market_video_slot() -> str:
+    now = radar.now_local()
+
+    for slot_time in market_video.MARKET_VIDEO_POST_TIMES:
+        if video_post_exists(slot_time):
+            continue
+
+        scheduled = radar.scheduled_datetime_today(slot_time)
+        grace_until = scheduled + timedelta(minutes=VIDEO_MISSED_GRACE_MINUTES)
+
+        if now < scheduled:
+            return f"next={slot_time} now={now.strftime('%H:%M:%S')}"
+
+        if scheduled <= now <= grace_until:
+            return f"due={slot_time} now={now.strftime('%H:%M:%S')} grace_until={grace_until.strftime('%H:%M:%S')}"
+
+    return f"no remaining slot today now={now.strftime('%H:%M:%S')}"
+
+
 def find_due_market_video_time():
     now = radar.now_local()
 
@@ -75,7 +110,14 @@ def find_due_market_video_time():
             return slot_time
 
         if now > grace_until:
-            print(f"跳过错过的行情视频：{slot_time}")
+            print(
+                "[market-video] skip missed slot",
+                slot_time,
+                "now=",
+                now.strftime("%H:%M:%S"),
+                "grace_until=",
+                grace_until.strftime("%H:%M:%S"),
+            )
             record_video_post(slot_time, "skipped", error="MISSED_BY_VIDEO_SCHEDULER")
             continue
 
@@ -101,48 +143,56 @@ def cleanup_video_file(video_path: str):
     try:
         Path(video_path).unlink(missing_ok=True)
     except Exception as e:
-        print("清理行情视频临时文件失败:", e)
+        print("[market-video] cleanup temporary file failed:", e)
+
+
+async def build_and_send_market_video(bot: Bot, slot_time: str):
+    result = {}
+    try:
+        print(f"[market-video] generating slot={slot_time}")
+        result = await asyncio.to_thread(
+            market_video.build_market_video,
+            radar.SYMBOLS,
+            radar.SYMBOL_DISPLAY,
+        )
+
+        await send_video_to_channel(bot, result["video_path"], result["caption"])
+        record_video_post(
+            slot_time,
+            "sent",
+            headline=result.get("headline", ""),
+            video_path=result.get("video_path", ""),
+        )
+        print(f"[market-video] sent slot={slot_time} headline={result.get('headline', '')}")
+    except Exception as e:
+        record_video_post(slot_time, "failed", error=str(e))
+        print(f"[market-video] failed slot={slot_time}: {e}")
+    finally:
+        cleanup_video_file(result.get("video_path", ""))
 
 
 async def market_video_loop(bot: Bot):
     if not market_video.ENABLE_MARKET_VIDEOS:
-        print("横屏行情视频：未开启 ENABLE_MARKET_VIDEOS")
+        print("[market-video] disabled: ENABLE_MARKET_VIDEOS is not true")
         return
 
-    await asyncio.sleep(20)
-    print("横屏行情视频调度已启动:", ", ".join(market_video.MARKET_VIDEO_POST_TIMES))
+    await asyncio.sleep(VIDEO_STARTUP_DELAY_SECONDS)
+    print("[market-video] enabled")
+    print("[market-video] slots:", ", ".join(market_video.MARKET_VIDEO_POST_TIMES))
+    print("[market-video] missed grace minutes:", VIDEO_MISSED_GRACE_MINUTES)
+    print("[market-video] startup status:", describe_next_market_video_slot())
+
+    if VIDEO_TEST_ON_STARTUP and not video_post_exists("startup"):
+        await build_and_send_market_video(bot, "startup")
 
     while True:
         try:
             slot_time = find_due_market_video_time()
             if slot_time:
-                print(f"准备生成横屏行情视频：{slot_time}")
-                result = await asyncio.to_thread(
-                    market_video.build_market_video,
-                    radar.SYMBOLS,
-                    radar.SYMBOL_DISPLAY,
-                )
-
-                try:
-                    await send_video_to_channel(bot, result["video_path"], result["caption"])
-                    record_video_post(
-                        slot_time,
-                        "sent",
-                        headline=result.get("headline", ""),
-                        video_path=result.get("video_path", ""),
-                    )
-                    print(f"横屏行情视频已发送：{slot_time} {result.get('headline', '')}")
-                finally:
-                    cleanup_video_file(result.get("video_path", ""))
+                await build_and_send_market_video(bot, slot_time)
 
         except Exception as e:
-            print("横屏行情视频处理失败:", e)
-            try:
-                slot_time = find_due_market_video_time()
-                if slot_time:
-                    record_video_post(slot_time, "failed", error=str(e))
-            except Exception as log_error:
-                print("横屏行情视频失败日志写入失败:", log_error)
+            print("[market-video] loop error:", e)
 
         await asyncio.sleep(VIDEO_CHECK_INTERVAL_SECONDS)
 
@@ -168,13 +218,13 @@ async def main_async():
     except Exception as e:
         print("delete_webhook 失败，可忽略:", e)
 
-    print("石墨烯雷达增强入口启动成功")
-    print("频道:", radar.CHAT_ID)
-    print("固定栏目:", radar.DAILY_FIXED_POSTS, "条/天")
-    print("行情检查间隔:", radar.PRICE_CHECK_INTERVAL_SECONDS // 60, "分钟")
-    print("横屏行情视频:", "开启" if market_video.ENABLE_MARKET_VIDEOS else "关闭")
+    print("[startup] smx2 enhanced runner started")
+    print("[startup] chat:", radar.CHAT_ID)
+    print("[startup] fixed posts per day:", radar.DAILY_FIXED_POSTS)
+    print("[startup] alert check minutes:", radar.PRICE_CHECK_INTERVAL_SECONDS // 60)
+    print("[startup] market video enabled:", market_video.ENABLE_MARKET_VIDEOS)
     if market_video.ENABLE_MARKET_VIDEOS:
-        print("横屏行情视频时间:", ", ".join(market_video.MARKET_VIDEO_POST_TIMES))
+        print("[startup] market video slots:", ", ".join(market_video.MARKET_VIDEO_POST_TIMES))
 
     tasks = [
         radar.fixed_schedule_loop(bot),
