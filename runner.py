@@ -195,7 +195,7 @@ async def market_video_loop(bot: Bot):
     print("[market-video] missed grace minutes:", VIDEO_MISSED_GRACE_MINUTES)
     print("[market-video] startup status:", describe_next_market_video_slot())
 
-    if VIDEO_TEST_ON_STARTUP and video_post_status("startup") != "sent":
+    if VIDEO_TEST_ON_STARTUP:
         await build_and_send_market_video(bot, "startup")
 
     while True:
