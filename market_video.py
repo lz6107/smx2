@@ -121,6 +121,23 @@ def ass_color(hex_color: str) -> str:
     return f"&H00{bb}{gg}{rr}&"
 
 
+def resolve_ffmpeg_binary() -> str:
+    system_ffmpeg = shutil.which(FFMPEG_BINARY)
+    if system_ffmpeg:
+        return system_ffmpeg
+
+    try:
+        import imageio_ffmpeg
+
+        bundled_ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        if bundled_ffmpeg and Path(bundled_ffmpeg).exists():
+            return bundled_ffmpeg
+    except Exception as e:
+        print("[market-video] imageio-ffmpeg fallback unavailable:", e)
+
+    raise RuntimeError(f"找不到 ffmpeg: {FFMPEG_BINARY}")
+
+
 def http_get_json(url: str, params=None, timeout=12):
     response = requests.get(url, params=params, timeout=timeout)
     response.raise_for_status()
@@ -458,8 +475,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 def run_ffmpeg(ass_path: Path, video_path: Path, width: int, height: int, duration: int) -> None:
-    if not shutil.which(FFMPEG_BINARY):
-        raise RuntimeError(f"找不到 ffmpeg: {FFMPEG_BINARY}")
+    ffmpeg_binary = resolve_ffmpeg_binary()
 
     video_src = f"color=c=0x07111F:s={width}x{height}:r=30:d={duration}"
     audio_src = (
@@ -469,7 +485,7 @@ def run_ffmpeg(ass_path: Path, video_path: Path, width: int, height: int, durati
     filter_path = str(ass_path).replace("\\", "/").replace(":", "\\:")
 
     cmd = [
-        FFMPEG_BINARY,
+        ffmpeg_binary,
         "-y",
         "-f", "lavfi", "-i", video_src,
         "-f", "lavfi", "-i", audio_src,
