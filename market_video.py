@@ -11,10 +11,12 @@ import requests
 from PIL import Image, ImageDraw, ImageFont
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent
 BINANCE_BASE_URL = "https://api.binance.com"
 DEFAULT_VIDEO_TIMES = "09:00,12:00,15:30,20:00,23:20"
 VIDEO_CATEGORY = "行情视频"
 VIDEO_KEYWORDS = ["BTC", "ETH", "SOL", "USDT资金", "山寨币"]
+BUNDLED_MARKET_VIDEO_FONT = PROJECT_ROOT / "assets" / "fonts" / "NotoSansSC-Bold.ttf"
 
 
 def env_bool(name: str, default: str = "false") -> bool:
@@ -37,11 +39,12 @@ MARKET_VIDEO_POST_TIMES = [
 ]
 MARKET_VIDEO_WIDTH = env_int("MARKET_VIDEO_WIDTH", 1920, 1280, 3840)
 MARKET_VIDEO_HEIGHT = env_int("MARKET_VIDEO_HEIGHT", 1080, 720, 2160)
-MARKET_VIDEO_DURATION_SECONDS = env_int("MARKET_VIDEO_DURATION_SECONDS", 80, 65, 180)
+MARKET_VIDEO_DURATION_SECONDS = env_int("MARKET_VIDEO_DURATION_SECONDS", 96, 65, 180)
 MARKET_VIDEO_KEEP_FILES = env_bool("MARKET_VIDEO_KEEP_FILES", "false")
 FFMPEG_BINARY = os.getenv("FFMPEG_BINARY", "ffmpeg").strip() or "ffmpeg"
 MARKET_VIDEO_DIR = Path(os.getenv("MARKET_VIDEO_DIR", "market_videos"))
 MARKET_VIDEO_AUDIO_MODE = os.getenv("MARKET_VIDEO_AUDIO_MODE", "silent").strip().lower()
+MARKET_VIDEO_FONT_PATH = os.getenv("MARKET_VIDEO_FONT_PATH", "").strip()
 
 
 def safe_float(value, default=None):
@@ -377,27 +380,58 @@ def hex_to_rgb(hex_color: str) -> tuple:
     return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
 
 
-def load_font(size: int, bold: bool = False):
-    candidates = [
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc" if bold else "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc" if bold else "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-        "C:/Windows/Fonts/msyhbd.ttc" if bold else "C:/Windows/Fonts/msyh.ttc",
-        "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+RESOLVED_MARKET_VIDEO_FONT: Optional[Path] = None
+FONT_CACHE = {}
+FONT_HEALTH_LOGGED = False
+
+
+def normalize_font_path(path: str) -> Path:
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = PROJECT_ROOT / candidate
+    return candidate
+
+
+def market_video_font_candidates() -> List[Path]:
+    if MARKET_VIDEO_FONT_PATH:
+        return [normalize_font_path(MARKET_VIDEO_FONT_PATH)]
+
+    return [
+        BUNDLED_MARKET_VIDEO_FONT,
+        Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc"),
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+        Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"),
+        Path("C:/Windows/Fonts/msyhbd.ttc"),
+        Path("C:/Windows/Fonts/arialbd.ttf"),
     ]
 
-    for path in candidates:
+
+def resolve_market_video_font_path() -> Path:
+    global RESOLVED_MARKET_VIDEO_FONT
+    if RESOLVED_MARKET_VIDEO_FONT:
+        return RESOLVED_MARKET_VIDEO_FONT
+
+    errors = []
+    for candidate in market_video_font_candidates():
         try:
-            if path and Path(path).exists():
-                return ImageFont.truetype(path, size)
-        except Exception:
-            continue
+            if not candidate.exists():
+                errors.append(f"{candidate} missing")
+                continue
+            ImageFont.truetype(str(candidate), 96)
+            RESOLVED_MARKET_VIDEO_FONT = candidate
+            print(f"[market-video] font path: {candidate}")
+            return candidate
+        except Exception as e:
+            errors.append(f"{candidate} failed: {e}")
 
-    return ImageFont.load_default()
+    hint = "MARKET_VIDEO_FONT_PATH is set; check that path" if MARKET_VIDEO_FONT_PATH else "bundled font is missing"
+    raise RuntimeError(f"market video scalable font unavailable ({hint}): {'; '.join(errors[-4:])}")
 
 
-FONT_CACHE = {}
+def load_font(size: int, bold: bool = False):
+    font_path = resolve_market_video_font_path()
+    return ImageFont.truetype(str(font_path), size)
 
 
 def font(size: int, bold: bool = False):
@@ -407,13 +441,35 @@ def font(size: int, bold: bool = False):
     return FONT_CACHE[key]
 
 
+def validate_market_video_font() -> None:
+    global FONT_HEALTH_LOGGED
+    if FONT_HEALTH_LOGGED:
+        return
+
+    test_font = font(160, True)
+    img = Image.new("RGB", (900, 260), "#000000")
+    draw = ImageDraw.Draw(img)
+    box = draw.textbbox((0, 0), "SMX 123 USDT资金", font=test_font)
+    width = box[2] - box[0]
+    height = box[3] - box[1]
+    if width < 520 or height < 95:
+        raise RuntimeError(
+            f"market video font health check failed: bbox={width}x{height}, "
+            "refusing to render tiny fallback font"
+        )
+
+    print(f"[market-video] font health ok: bbox={width}x{height} size=160")
+    FONT_HEALTH_LOGGED = True
+
+
 def draw_text(draw: ImageDraw.ImageDraw, xy: tuple, text: str, size: int, color: str = "#FFFFFF",
-              bold: bool = False, anchor: str = "la", max_width: Optional[int] = None):
+              bold: bool = False, anchor: str = "la", max_width: Optional[int] = None,
+              min_size: int = 48):
     value = str(text or "")
     selected_font = font(size, bold)
 
     if max_width:
-        while size > 14:
+        while size > min_size:
             box = draw.textbbox((0, 0), value, font=selected_font)
             if box[2] - box[0] <= max_width:
                 break
@@ -559,30 +615,33 @@ def draw_rank_bar(draw: ImageDraw.ImageDraw, item: dict, x: int, y: int, w: int,
     draw.rounded_rectangle((x + 430, y + 16, x + 430 + bar_w, y + 48), radius=14, fill=hex_to_rgb(color))
 
 
+def scene_start_times(duration: int) -> dict:
+    return {
+        "overview": 0,
+        "btc": max(10, int(duration * 0.15)),
+        "eth_sol": max(22, int(duration * 0.34)),
+        "usdt": max(34, int(duration * 0.52)),
+        "alts": max(46, int(duration * 0.70)),
+        "keywords": max(58, int(duration * 0.87)),
+    }
+
+
 def scene_for_second(second: int, duration: int) -> str:
-    if second < 12:
-        return "overview"
-    if second < 30:
-        return "majors"
-    if second < 45:
-        return "flow"
-    if second < max(60, duration - 10):
-        return "alts"
-    return "keywords"
+    starts = scene_start_times(duration)
+    scene = "overview"
+    for name, start in sorted(starts.items(), key=lambda x: x[1]):
+        if second >= start:
+            scene = name
+    return scene
 
 
 def scene_progress(second: int, duration: int) -> float:
-    starts = {
-        "overview": 0,
-        "majors": 12,
-        "flow": 30,
-        "alts": 45,
-        "keywords": max(60, duration - 10),
-    }
+    starts = scene_start_times(duration)
     scene = scene_for_second(second, duration)
+    ordered = sorted(starts.items(), key=lambda x: x[1])
     start = starts[scene]
     next_start = duration
-    for value in sorted(starts.values()):
+    for _, value in ordered:
         if value > start:
             next_start = value
             break
@@ -590,21 +649,42 @@ def scene_progress(second: int, duration: int) -> float:
 
 
 def draw_scene_header(draw: ImageDraw.ImageDraw, title: str, subtitle: str, second: int, duration: int):
-    draw_text(draw, (72, 54), "SMX FINANCE // MARKET REFERENCE", 38, "#FFD28A", True)
-    draw_text(draw, (72, 118), title, 82, "#FFFFFF", True, max_width=1660)
-    draw_text(draw, (76, 210), subtitle, 42, "#9AA7B8", True, max_width=1540)
-    progress_w = int(1776 * (second + 1) / max(1, duration))
-    draw_round_rect(draw, (72, 1018, 1848, 1036), "#17263A", "#243C59", 9, 1)
-    draw.rounded_rectangle((72, 1018, 72 + progress_w, 1036), radius=9, fill=hex_to_rgb("#8AD8FF"))
+    draw_text(draw, (82, 52), "SMX FINANCE / MARKET VIDEO", 48, "#FFD28A", True, min_size=48)
+    draw_text(draw, (82, 130), title, 132, "#FFFFFF", True, max_width=1710, min_size=116)
+    if subtitle:
+        draw_text(draw, (88, 284), subtitle, 64, "#AFC3D8", True, max_width=1680, min_size=56)
+
+    progress_w = int(1756 * (second + 1) / max(1, duration))
+    draw_round_rect(draw, (82, 1010, 1838, 1038), "#17263A", "#29496B", 14, 1)
+    draw.rounded_rectangle((82, 1010, 82 + progress_w, 1038), radius=14, fill=hex_to_rgb("#8AD8FF"))
 
 
-def draw_big_metric(draw: ImageDraw.ImageDraw, box: tuple, label: str, value: str, color: str, note: str = ""):
-    x1, y1, x2, y2 = box
-    draw_round_rect(draw, box, "#0B1B2C", "#24415F", 26, 3)
-    draw_text(draw, (x1 + 38, y1 + 32), label.upper(), 34, "#8AD8FF", True)
-    draw_text(draw, (x1 + 38, y1 + 95), value, 76, color, True, max_width=x2 - x1 - 76)
-    if note:
-        draw_text(draw, (x1 + 38, y2 - 58), note, 32, "#9AA7B8", True, max_width=x2 - x1 - 76)
+def draw_big_label(draw: ImageDraw.ImageDraw, text: str, xy: tuple, color: str = "#8AD8FF"):
+    draw_text(draw, xy, text.upper(), 64, color, True, max_width=1000, min_size=56)
+
+
+def draw_big_value(draw: ImageDraw.ImageDraw, text: str, xy: tuple, color: str = "#FFFFFF",
+                   size: int = 180, max_width: int = 1600):
+    draw_text(draw, xy, text, size, color, True, max_width=max_width, min_size=120)
+
+
+def draw_large_sparkline(draw: ImageDraw.ImageDraw, values: List[float], box: tuple, color: str, reveal: float = 1.0):
+    x, y, w, h = box
+    points = sparkline_points(values, x, y, w, h)
+    draw_round_rect(draw, (x - 26, y - 28, x + w + 26, y + h + 28), "#0A1A2B", "#24415F", 34, 3)
+    draw.line((x, y + h // 2, x + w, y + h // 2), fill=hex_to_rgb("#2A415A"), width=5)
+    if len(points) < 2:
+        return
+    reveal_count = max(2, min(len(points), int(len(points) * clamp(reveal, 0.05, 1.0))))
+    visible = points[:reveal_count]
+    draw.line(visible, fill=hex_to_rgb(color), width=18, joint="curve")
+    px, py = visible[-1]
+    draw.ellipse((px - 18, py - 18, px + 18, py + 18), fill=hex_to_rgb(color))
+
+
+def draw_split_metric(draw: ImageDraw.ImageDraw, x: int, y: int, label: str, value: str, color: str):
+    draw_text(draw, (x, y), label.upper(), 58, "#8AD8FF", True, max_width=540, min_size=56)
+    draw_text(draw, (x, y + 76), value, 116, color, True, max_width=620, min_size=96)
 
 
 def render_overview_frame(draw: ImageDraw.ImageDraw, market: Dict[str, dict], second: int, duration: int):
@@ -612,76 +692,87 @@ def render_overview_frame(draw: ImageDraw.ImageDraw, market: Dict[str, dict], se
     view = english_state(state)
     breadth = state["breadth"]
     status_color = "#19D27F" if view["status"] == "STRONG" else "#FF5B6B" if view["status"] == "WEAK" else "#8AD8FF"
-    draw_scene_header(draw, "MARKET SNAPSHOT", view["headline"], second, duration)
-    draw_big_metric(draw, (90, 330, 610, 650), "STATE", view["status"], status_color, "4H bias from majors")
-    draw_big_metric(draw, (700, 330, 1220, 650), "BREADTH", f"{breadth.get('up', 0)} UP / {breadth.get('down', 0)} DOWN", "#FFFFFF", "24H direction count")
-    draw_big_metric(draw, (1310, 330, 1830, 650), "USDT FLOW", format_percent_video(breadth.get("avg_volume_change")), "#FFD28A", "4H volume change")
-    draw_text(draw, (110, 760), "READ:", 42, "#8AD8FF", True)
-    draw_text(draw, (250, 760), "Confirm BTC first, then compare ETH/SOL follow-through.", 48, "#FFFFFF", True, max_width=1480)
-    draw_text(draw, (250, 835), "Use altcoin strength as a flow signal, not a single candle chase.", 42, "#9AA7B8", True, max_width=1480)
+    draw_scene_header(draw, "MARKET SNAPSHOT", "One screen. One read.", second, duration)
+    draw_big_label(draw, "STATE", (110, 410))
+    draw_big_value(draw, view["status"], (105, 485), status_color, 224, 880)
+    draw_split_metric(draw, 1020, 438, "Breadth", f"{breadth.get('up', 0)} / {breadth.get('down', 0)}", "#FFFFFF")
+    draw_split_metric(draw, 1020, 660, "USDT Flow", format_percent_video(breadth.get("avg_volume_change")), "#FFD28A")
+    draw_text(draw, (110, 850), view["headline"], 72, "#EAF1FA", True, max_width=1660, min_size=64)
 
 
-def render_majors_frame(draw: ImageDraw.ImageDraw, market: Dict[str, dict], second: int, duration: int):
-    draw_scene_header(draw, "MAJOR COINS", "BTC / ETH / SOL, 24 x 1H candles", second, duration)
-    reveal = scene_progress(second, duration)
-    chart_items = [item_by_display(market, "BTC"), item_by_display(market, "ETH"), item_by_display(market, "SOL")]
-    y = 305
-    for item in chart_items:
+def render_btc_frame(draw: ImageDraw.ImageDraw, market: Dict[str, dict], second: int, duration: int):
+    btc = item_by_display(market, "BTC")
+    color = trend_color(btc.get("change_4h"))
+    draw_scene_header(draw, "BTC LEAD SIGNAL", "Watch BTC before chasing altcoins.", second, duration)
+    draw_text(draw, (110, 410), "BTC", 178, "#FFFFFF", True, max_width=480, min_size=150)
+    draw_big_value(draw, f"${format_price_video(btc.get('price'))}", (560, 415), "#FFFFFF", 150, 1000)
+    draw_split_metric(draw, 110, 660, "1H", format_percent_video(btc.get("change_1h")), trend_color(btc.get("change_1h")))
+    draw_split_metric(draw, 450, 660, "4H", format_percent_video(btc.get("change_4h")), color)
+    draw_split_metric(draw, 790, 660, "24H", format_percent_video(btc.get("change_24h")), trend_color(btc.get("change_24h")))
+    draw_large_sparkline(draw, btc.get("closes") or [], (1120, 520, 650, 250), color, scene_progress(second, duration))
+
+
+def render_eth_sol_frame(draw: ImageDraw.ImageDraw, market: Dict[str, dict], second: int, duration: int):
+    eth = item_by_display(market, "ETH")
+    sol = item_by_display(market, "SOL")
+    draw_scene_header(draw, "ETH / SOL FOLLOW", "Confirm whether major coins follow BTC.", second, duration)
+    for x, item in ((115, eth), (1010, sol)):
         color = trend_color(item.get("change_4h"))
-        draw_round_rect(draw, (92, y, 1828, y + 190), "#0B1B2C", "#24415F", 24, 3)
-        draw.rectangle((92, y, 104, y + 190), fill=hex_to_rgb(color))
-        draw_text(draw, (135, y + 35), item.get("display", "-"), 66, "#FFFFFF", True)
-        draw_text(draw, (360, y + 44), f"${format_price_video(item.get('price'))}", 44, "#EAF1FA", True, max_width=360)
-        draw_text(draw, (820, y + 32), "1H", 32, "#9AA7B8", True)
-        draw_text(draw, (900, y + 32), format_percent_video(item.get("change_1h")), 42, trend_color(item.get("change_1h")), True, max_width=180)
-        draw_text(draw, (1100, y + 32), "4H", 32, "#9AA7B8", True)
-        draw_text(draw, (1180, y + 32), format_percent_video(item.get("change_4h")), 42, color, True, max_width=180)
-        draw_sparkline(draw, item.get("closes") or [], (135, y + 112, 1560, 46), color, reveal)
-        y += 225
+        draw_text(draw, (x, 420), item.get("display", "-"), 160, "#FFFFFF", True, max_width=320, min_size=140)
+        draw_text(draw, (x, 590), f"${format_price_video(item.get('price'))}", 102, "#EAF1FA", True, max_width=720, min_size=88)
+        draw_text(draw, (x, 725), f"4H {format_percent_video(item.get('change_4h'))}", 120, color, True, max_width=720, min_size=96)
+        draw_large_sparkline(draw, item.get("closes") or [], (x, 860, 705, 80), color, scene_progress(second, duration))
 
 
-def render_flow_frame(draw: ImageDraw.ImageDraw, market: Dict[str, dict], second: int, duration: int):
+def render_usdt_frame(draw: ImageDraw.ImageDraw, market: Dict[str, dict], second: int, duration: int):
     state = market_state(market)
     view = english_state(state)
     breadth = state["breadth"]
-    draw_scene_header(draw, "USDT FLOW", view["usdt"], second, duration)
-    draw_round_rect(draw, (120, 340, 1800, 560), "#0B1B2C", "#24415F", 28, 3)
-    draw_text(draw, (170, 380), "MARKET BREADTH", 42, "#8AD8FF", True)
-    draw_breadth_bar(draw, breadth, 170, 455, 1560, 38)
-    draw_big_metric(draw, (120, 610, 620, 850), "AVG 1H", format_percent_video(breadth.get("avg_1h")), "#FFFFFF", "short-term heat")
-    draw_big_metric(draw, (710, 610, 1210, 850), "VOLUME FLOW", format_percent_video(breadth.get("avg_volume_change")), "#FFD28A", "USDT pairs")
-    draw_big_metric(draw, (1300, 610, 1800, 850), "VALID PAIRS", str(breadth.get("valid", 0)), "#8AD8FF", "tracked symbols")
+    draw_scene_header(draw, "USDT FLOW", "Liquidity check from USDT pairs.", second, duration)
+    volume = breadth.get("avg_volume_change")
+    color = "#19D27F" if (volume or 0) >= 15 else "#FF5B6B" if (volume or 0) <= -15 else "#FFD28A"
+    draw_big_label(draw, "VOLUME FLOW", (125, 430), "#FFD28A")
+    draw_big_value(draw, format_percent_video(volume), (120, 512), color, 230, 980)
+    draw_text(draw, (122, 800), view["usdt"], 76, "#EAF1FA", True, max_width=1540, min_size=64)
+    up = breadth.get("up", 0)
+    down = breadth.get("down", 0)
+    total = max(1, up + down)
+    up_w = int(720 * up / total)
+    draw_round_rect(draw, (1060, 500, 1780, 585), "#17263A", "#29496B", 42, 2)
+    if up_w > 0:
+        draw.rounded_rectangle((1060, 500, 1060 + up_w, 585), radius=42, fill=hex_to_rgb("#19D27F"))
+    if up_w < 720:
+        draw.rounded_rectangle((1060 + up_w, 500, 1780, 585), radius=42, fill=hex_to_rgb("#FF5B6B"))
+    draw_text(draw, (1065, 630), f"{up} UP / {down} DOWN", 78, "#FFFFFF", True, max_width=760, min_size=66)
 
 
 def render_alts_frame(draw: ImageDraw.ImageDraw, market: Dict[str, dict], second: int, duration: int):
-    strong = top_items(market, "change_4h", 5, True)
-    weak = [item for item in top_items(market, "change_4h", 10, False) if (item.get("change_4h") or 0) < 0][:4]
-    draw_scene_header(draw, "ALTCOIN RANK", "4H strength first, weakness second", second, duration)
-    draw_panel_title(draw, "Strength", 135, 310)
+    strong = top_items(market, "change_4h", 3, True)
+    weak = [item for item in top_items(market, "change_4h", 8, False) if (item.get("change_4h") or 0) < 0][:3]
+    draw_scene_header(draw, "ALTCOIN RANK", "Top 3 strength. Top 3 weakness.", second, duration)
+    draw_big_label(draw, "STRENGTH", (115, 380), "#19D27F")
+    draw_big_label(draw, "WEAKNESS", (1040, 380), "#FF5B6B")
     for i, item in enumerate(strong, 1):
-        draw_rank_bar(draw, item, 135, 390 + (i - 1) * 92, 330, "#19D27F", i)
-    draw_panel_title(draw, "Weakness", 1030, 310)
+        y = 500 + (i - 1) * 145
+        draw_text(draw, (115, y), f"{i}. {item.get('display', '-')}", 92, "#FFFFFF", True, max_width=380, min_size=78)
+        draw_text(draw, (500, y), format_percent_video(item.get("change_4h")), 92, "#19D27F", True, max_width=360, min_size=78)
     if weak:
         for i, item in enumerate(weak, 1):
-            draw_rank_bar(draw, item, 1030, 390 + (i - 1) * 92, 330, "#FF5B6B", i)
+            y = 500 + (i - 1) * 145
+            draw_text(draw, (1040, y), f"{i}. {item.get('display', '-')}", 92, "#FFFFFF", True, max_width=380, min_size=78)
+            draw_text(draw, (1425, y), format_percent_video(item.get("change_4h")), 92, "#FF5B6B", True, max_width=360, min_size=78)
     else:
-        draw_text(draw, (1030, 410), "No clear 4H weakness", 54, "#9AA7B8", True)
-    draw_text(draw, (135, 890), "Meaning: rank shows where short-term attention is clustering.", 44, "#FFFFFF", True, max_width=1500)
+        draw_text(draw, (1040, 530), "NO CLEAR WEAKNESS", 84, "#AFC3D8", True, max_width=760, min_size=70)
 
 
 def render_keywords_scene(draw: ImageDraw.ImageDraw, market: Dict[str, dict], second: int, duration: int):
-    state = market_state(market)
-    view = english_state(state)
-    draw_scene_header(draw, "KEYWORDS", "5 search words, no stacking", second, duration)
-    keywords = ["BTC", "ETH", "SOL", "USDT FLOW", "ALTCOINS"]
+    draw_scene_header(draw, "SEARCH KEYWORDS", "5 words only. No stacking.", second, duration)
+    keywords = ["BTC", "ETH", "SOL", "USDT资金", "山寨币"]
+    positions = [(120, 410), (660, 410), (1195, 410), (250, 670), (1030, 670)]
     colors = ["#8AD8FF", "#19D27F", "#FFD28A", "#FF9F6E", "#EAF1FA"]
-    for i, keyword in enumerate(keywords):
-        x = 140 + (i % 3) * 560
-        y = 360 + (i // 3) * 210
-        draw_round_rect(draw, (x, y, x + 460, y + 150), "#0B1B2C", "#24415F", 26, 3)
-        draw_text(draw, (x + 230, y + 76), keyword, 56, colors[i], True, anchor="mm", max_width=410)
-    draw_text(draw, (140, 850), view["headline"], 48, "#FFFFFF", True, max_width=1550)
-    draw_text(draw, (140, 925), "Reference only. Silent data screen. Caption keeps Chinese keywords.", 38, "#9AA7B8", True, max_width=1550)
+    for keyword, xy, color in zip(keywords, positions, colors):
+        draw_text(draw, xy, keyword, 138, color, True, max_width=650, min_size=112)
+    draw_text(draw, (120, 900), "Caption keeps: BTC ETH SOL USDT资金 山寨币", 72, "#FFFFFF", True, max_width=1620, min_size=64)
 
 
 def render_dashboard_frame(market: Dict[str, dict], frame_path: Path, width: int, height: int,
@@ -692,10 +783,12 @@ def render_dashboard_frame(market: Dict[str, dict], frame_path: Path, width: int
     scene = scene_for_second(second, duration)
     if scene == "overview":
         render_overview_frame(draw, market, second, duration)
-    elif scene == "majors":
-        render_majors_frame(draw, market, second, duration)
-    elif scene == "flow":
-        render_flow_frame(draw, market, second, duration)
+    elif scene == "btc":
+        render_btc_frame(draw, market, second, duration)
+    elif scene == "eth_sol":
+        render_eth_sol_frame(draw, market, second, duration)
+    elif scene == "usdt":
+        render_usdt_frame(draw, market, second, duration)
     elif scene == "alts":
         render_alts_frame(draw, market, second, duration)
     else:
@@ -867,6 +960,8 @@ def build_market_video(symbols: List[str], display_map: Dict[str, str]) -> dict:
     height = MARKET_VIDEO_HEIGHT
     duration = MARKET_VIDEO_DURATION_SECONDS
     MARKET_VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+    validate_market_video_font()
+    print(f"[market-video] render settings: {width}x{height} duration={duration}s audio=silent")
 
     market = fetch_enhanced_market_data(symbols, display_map)
     state = market_state(market)
