@@ -321,12 +321,22 @@ def market_state(market: Dict[str, dict]) -> dict:
 
 def video_caption(state: dict) -> str:
     keyword_line = " ".join(VIDEO_KEYWORDS[:5])
-    return (
+    breadth = state.get("breadth", {})
+    up = breadth.get("up", 0)
+    down = breadth.get("down", 0)
+    avg_1h = format_percent_video(breadth.get("avg_1h"))
+    volume_flow = format_percent_video(breadth.get("avg_volume_change"))
+    caption = (
         "【石墨烯财经｜行情视频】\n\n"
-        f"{state['headline']}。{state['focus']}。\n\n"
+        f"今日加密货币短线行情：{state['headline']}。{state['focus']}。\n"
+        f"BTC仍是盘面主线，ETH和SOL看跟随力度，山寨币只看强弱扩散，不追单点拉升。\n"
+        f"USDT资金观察：{state['usdt_view']}，现货与合约情绪都要看成交是否放大。\n"
+        f"市场广度：上涨 {up} 个 / 下跌 {down} 个，1小时平均波动 {avg_1h}，USDT成交变化 {volume_flow}。\n"
+        "短线参考：先看比特币方向，再看以太坊、SOL和山寨币轮动，注意资金流、成交量和风险控制。\n\n"
         f"关键词：{keyword_line}\n"
         "#BTC #USDT #山寨币"
     )
+    return caption[:1024]
 
 
 def make_dialogue(start: str, end: str, style: str, text: str, x: int, y: int, align: int = 7) -> str:
