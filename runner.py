@@ -235,6 +235,10 @@ async def main_async():
     print("[startup] chat:", radar.CHAT_ID)
     print("[startup] fixed posts per day:", radar.DAILY_FIXED_POSTS)
     print("[startup] alert check minutes:", radar.PRICE_CHECK_INTERVAL_SECONDS // 60)
+    print("[startup] search trend enabled:", radar.ENABLE_SEARCH_TREND_COLUMNS)
+    print("[startup] search trend terms:", ", ".join(radar.SEARCH_TREND_TERMS) or "none")
+    if radar.IGNORED_SEARCH_TREND_TERMS:
+        print("[startup] ignored search terms:", ", ".join(radar.IGNORED_SEARCH_TREND_TERMS))
     print("[startup] market video enabled:", market_video.ENABLE_MARKET_VIDEOS)
     if market_video.ENABLE_MARKET_VIDEOS:
         print("[startup] market video slots:", ", ".join(market_video.MARKET_VIDEO_POST_TIMES))

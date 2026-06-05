@@ -2,7 +2,7 @@ import os
 import json
 import time
 import asyncio
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from typing import Dict, Optional, List
 
 import requests
@@ -84,10 +84,10 @@ DAILY_POST_PLAN = [
         "slot_no": 6,
         "slot_key": "hot_words_2",
         "time": "16:00",
-        "category": "热词榜",
-        "title": "热词榜",
-        "image_key": "hot_words",
-        "focus": "下午热词梳理，观察市场注意力是否从主流币扩散到山寨、MEME、AI币。",
+        "category": "行情热搜",
+        "title": "行情热搜",
+        "image_key": "search_market",
+        "focus": "围绕行情、BTC、ETH、SOL、USDT梳理真实市场数据，不使用无关热词。",
     },
     {
         "slot_no": 7,
@@ -197,6 +197,45 @@ def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, value))
 
 
+def env_date(name: str, default: str) -> date:
+    raw = os.getenv(name, default).strip()
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        print(f"[search-trend] invalid {name}={raw!r}, using {default}")
+        return date.fromisoformat(default)
+
+
+SEARCH_TREND_ALLOWLIST = {
+    "行情": "search_market",
+    "世界杯": "world_cup",
+}
+ENABLE_SEARCH_TREND_COLUMNS = env_bool("ENABLE_SEARCH_TREND_COLUMNS", "true")
+REQUESTED_SEARCH_TREND_TERMS = [
+    term.strip()
+    for term in os.getenv("SEARCH_TREND_TERMS", "行情,世界杯").split(",")
+    if term.strip()
+]
+SEARCH_TREND_TERMS = tuple(
+    term for term in REQUESTED_SEARCH_TREND_TERMS
+    if term in SEARCH_TREND_ALLOWLIST
+)
+IGNORED_SEARCH_TREND_TERMS = tuple(
+    term for term in REQUESTED_SEARCH_TREND_TERMS
+    if term not in SEARCH_TREND_ALLOWLIST
+)
+WORLD_CUP_TOPIC_START = env_date("WORLD_CUP_TOPIC_START", "2026-06-05")
+WORLD_CUP_TOPIC_END = env_date("WORLD_CUP_TOPIC_END", "2026-07-19")
+SPORTS_MARKET_SYMBOLS = [
+    symbol.strip().upper()
+    for symbol in os.getenv(
+        "SPORTS_MARKET_SYMBOLS",
+        "SANTOSUSDT,PORTOUSDT,LAZIOUSDT,ALPINEUSDT,PSGUSDT,CITYUSDT,BARUSDT",
+    ).split(",")
+    if symbol.strip()
+]
+
+
 MARKET_VIDEO_MISSED_GRACE_MINUTES = env_int("MARKET_VIDEO_MISSED_GRACE_MINUTES", 60, 20, 180)
 MARKET_VIDEO_STARTUP_DELAY_SECONDS = env_int("MARKET_VIDEO_STARTUP_DELAY_SECONDS", 20, 0, 120)
 MARKET_VIDEO_TEST_ON_STARTUP = env_bool("MARKET_VIDEO_TEST_ON_STARTUP", "false")
@@ -204,6 +243,8 @@ MARKET_VIDEO_TEST_ON_STARTUP = env_bool("MARKET_VIDEO_TEST_ON_STARTUP", "false")
 IMAGE_FILES = {
     "daily_watch": "images/daily_watch.png",
     "hot_words": "images/hot_words.png",
+    "search_market": "images/search_market.png",
+    "world_cup_market": "images/world_cup_market.png",
     "altcoin_radar": "images/altcoin_radar.png",
     "sentiment": "images/sentiment.png",
     "night_review": "images/night_review.png",
@@ -422,6 +463,40 @@ def now_local() -> datetime:
     return datetime.now(LOCAL_TZ)
 
 
+def search_trend_enabled(term: str) -> bool:
+    return ENABLE_SEARCH_TREND_COLUMNS and term in SEARCH_TREND_TERMS
+
+
+def world_cup_topic_active(on_date: Optional[date] = None) -> bool:
+    current = on_date or now_local().date()
+    return (
+        search_trend_enabled("世界杯")
+        and WORLD_CUP_TOPIC_START <= current <= WORLD_CUP_TOPIC_END
+    )
+
+
+def resolve_fixed_plan(plan: dict, on_date: Optional[date] = None) -> dict:
+    resolved = dict(plan)
+
+    if plan["slot_key"] == "hot_words_2" and not search_trend_enabled("行情"):
+        resolved.update({
+            "category": "热词榜",
+            "title": "热词榜",
+            "image_key": "hot_words",
+            "focus": "下午热词梳理，观察市场注意力是否从主流币扩散到山寨、MEME、AI币。",
+        })
+
+    if plan["slot_key"] == "sentiment_2" and world_cup_topic_active(on_date):
+        resolved.update({
+            "category": "世界杯资金观察",
+            "title": "世界杯资金观察",
+            "image_key": "world_cup_market",
+            "focus": "只根据真实行情观察世界杯搜索热度、球迷代币样本、USDT资金和市场风险偏好。",
+        })
+
+    return resolved
+
+
 def today_key() -> str:
     return now_local().strftime("%Y%m%d")
 
@@ -633,6 +708,39 @@ def fetch_market_data_sync() -> Dict[str, dict]:
 
 async def fetch_market_data() -> Dict[str, dict]:
     return await asyncio.to_thread(fetch_market_data_sync)
+
+
+def fetch_sports_market_data_sync() -> Dict[str, dict]:
+    base = "https://api.binance.com"
+    result: Dict[str, dict] = {}
+
+    for symbol in SPORTS_MARKET_SYMBOLS:
+        item = {
+            "symbol": symbol,
+            "display": symbol.removesuffix("USDT"),
+            "price": None,
+            "change_1h": None,
+            "change_24h": None,
+            "quote_volume": None,
+        }
+
+        try:
+            ticker = http_get_json(
+                f"{base}/api/v3/ticker/24hr",
+                params={"symbol": symbol},
+                timeout=6,
+            )
+            item["price"] = safe_float(ticker.get("lastPrice"))
+            item["change_24h"] = safe_float(ticker.get("priceChangePercent"))
+            item["quote_volume"] = safe_float(ticker.get("quoteVolume"))
+        except Exception as e:
+            print(f"[search-trend] sports ticker unavailable {symbol}:", e)
+            continue
+
+        result[symbol] = item
+        time.sleep(0.12)
+
+    return result
 
 
 def market_snapshot_text(market: Dict[str, dict]) -> str:
@@ -1004,11 +1112,77 @@ def fallback_alert_content(symbol: str, item: dict, market: Dict[str, dict]) -> 
 #{display} #行情异动 #加密市场""".strip()
 
 
+def build_search_market_content(market: Dict[str, dict]) -> str:
+    btc = market.get("BTCUSDT", {})
+    eth = market.get("ETHUSDT", {})
+    sol = market.get("SOLUSDT", {})
+    movers = top_movers(market, "change_1h", 3, True)
+    movers_text = "、".join(
+        f"{item['display']} {format_percent(item.get('change_1h'))}"
+        for item in movers
+    ) or "暂无明显领涨"
+
+    return f"""【石墨烯财经｜行情热搜】
+
+当前加密货币行情以 BTC 为主线，ETH 和 SOL 负责确认主流币跟随力度。
+
+BTC：1小时 {format_percent(btc.get('change_1h'))}，24小时 {format_percent(btc.get('change_24h'))}
+ETH：1小时 {format_percent(eth.get('change_1h'))}，24小时 {format_percent(eth.get('change_24h'))}
+SOL：1小时 {format_percent(sol.get('change_1h'))}，24小时 {format_percent(sol.get('change_24h'))}
+
+短线活跃靠前：{movers_text}
+
+石墨烯观察：
+看行情不能只看单币涨跌。现货成交、合约情绪和 USDT 资金如果同步放大，趋势才更有连续性。
+
+关键词：行情 BTC ETH SOL USDT
+#行情 #BTC #USDT""".strip()
+
+
+def build_world_cup_market_content(market: Dict[str, dict], sports_market: Dict[str, dict]) -> str:
+    btc = market.get("BTCUSDT", {})
+    mood = market_mood(market)
+    valid = [
+        item for item in sports_market.values()
+        if item.get("change_24h") is not None
+    ]
+    valid.sort(key=lambda item: abs(item.get("change_24h") or 0), reverse=True)
+
+    if valid:
+        sample_text = "、".join(
+            f"{item['display']} {format_percent(item.get('change_24h'))}"
+            for item in valid[:3]
+        )
+        sports_read = f"体育与球迷代币样本24小时波动：{sample_text}。"
+    else:
+        sports_read = "球迷代币行情数据暂不完整，本条不引用未经验证的代币涨跌。"
+
+    return f"""【石墨烯财经｜世界杯资金观察】
+
+世界杯临近，体育市场、球迷代币和预测市场相关搜索进入观察窗口。
+
+{sports_read}
+BTC 1小时 {format_percent(btc.get('change_1h'))}，24小时 {format_percent(btc.get('change_24h'))}；当前市场情绪为{mood}。
+
+石墨烯观察：
+世界杯热度不等于相关资产一定上涨。先看 BTC 和 USDT 资金环境，再看球迷代币是否出现多标的同步活跃；预测市场只做热度观察，不引用未验证盘口。
+
+关键词：世界杯 球迷代币 预测市场 USDT 行情
+#世界杯 #USDT #行情""".strip()
+
+
 # =========================
 # 内容生成
 # =========================
 
 async def generate_fixed_content(plan: dict, market: Dict[str, dict]) -> str:
+    if plan["title"] == "行情热搜":
+        return build_search_market_content(market)
+
+    if plan["title"] == "世界杯资金观察":
+        sports_market = await asyncio.to_thread(fetch_sports_market_data_sync)
+        return build_world_cup_market_content(market, sports_market)
+
     prompt = build_fixed_prompt(plan, market)
     ai_text = await call_openai(prompt)
 
@@ -1073,7 +1247,8 @@ def fixed_gap_ok() -> bool:
 def find_due_fixed_post() -> Optional[dict]:
     now = now_local()
 
-    for plan in DAILY_POST_PLAN:
+    for base_plan in DAILY_POST_PLAN:
+        plan = resolve_fixed_plan(base_plan, now.date())
         post_key = build_post_key(plan)
 
         if post_exists(post_key):
@@ -1313,6 +1488,11 @@ async def main_async():
     print("频道:", CHAT_ID)
     print("固定栏目:", DAILY_FIXED_POSTS, "条/天")
     print("行情检查间隔:", PRICE_CHECK_INTERVAL_SECONDS // 60, "分钟")
+    print("[search-trend] enabled:", ENABLE_SEARCH_TREND_COLUMNS)
+    print("[search-trend] active terms:", ", ".join(SEARCH_TREND_TERMS) or "none")
+    if IGNORED_SEARCH_TREND_TERMS:
+        print("[search-trend] ignored terms:", ", ".join(IGNORED_SEARCH_TREND_TERMS))
+    print("[search-trend] world cup window:", WORLD_CUP_TOPIC_START, "to", WORLD_CUP_TOPIC_END)
     print("[market-video] main.py enabled:", market_video.ENABLE_MARKET_VIDEOS)
     if market_video.ENABLE_MARKET_VIDEOS:
         print("[market-video] main.py slots:", ", ".join(market_video.MARKET_VIDEO_POST_TIMES))
