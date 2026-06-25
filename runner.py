@@ -256,6 +256,16 @@ async def main_async():
 
 
 def main():
+    engine = os.getenv("SMX2_ENGINE", "v1").strip().lower() or "v1"
+    if engine in {"v2_shadow", "v2_pilot", "v2_full"}:
+        import v2_main
+
+        v2_main.main()
+        return
+
+    if engine != "v1":
+        print(f"[startup] unknown SMX2_ENGINE={engine!r}, falling back to v1")
+
     asyncio.run(main_async())
 
 

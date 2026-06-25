@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.font_google/
+demo_video/
+market_videos/
+v2_outputs/
